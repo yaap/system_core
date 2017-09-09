@@ -52,7 +52,6 @@
 #define FAKE_BATTERY_CAPACITY 42
 #define FAKE_BATTERY_TEMPERATURE 424
 #define MILLION 1.0e6
-#define DEFAULT_VBUS_VOLTAGE 5000000
 
 using HealthInfo_1_0 = android::hardware::health::V1_0::HealthInfo;
 using HealthInfo_2_0 = android::hardware::health::V2_0::HealthInfo;
@@ -551,18 +550,30 @@ void BatteryMonitor::updateValues(void) {
                                  mChargerNames[i].c_str());
             }
 
-            int ChargingCurrent =
-                  (access(SYSFS_BATTERY_CURRENT, R_OK) == 0) ? abs(getIntField(String8(SYSFS_BATTERY_CURRENT))) : 0;
+            int ChargingCurrent = 0;
+            int ChargingVoltage = 0;
 
-            int ChargingVoltage;
-            if (access(SYSFS_BATTERY_VOLTAGE, R_OK) == 0) {
-                ChargingVoltage = getIntField(path);
+            // Prefer battery current_now / voltage_now
+            if (access(SYSFS_BATTERY_CURRENT, R_OK) == 0) {
+                ChargingCurrent = abs(getIntField(String8(SYSFS_BATTERY_CURRENT)));
             } else {
                 path.clear();
-                path.appendFormat("%s/%s/voltage_max_design", POWER_SUPPLY_SYSFS_PATH,
+                path.appendFormat("%s/%s/current_now", POWER_SUPPLY_SYSFS_PATH,
                                   mChargerNames[i].c_str());
-                ChargingVoltage = (access(path.c_str(), R_OK) == 0) ? getIntField(path)
-                                                                    : DEFAULT_VBUS_VOLTAGE;
+                if (access(path.c_str(), R_OK) == 0) {
+                    ChargingCurrent = abs(getIntField(path));
+                }
+            }
+
+            if (access(SYSFS_BATTERY_VOLTAGE, R_OK) == 0) {
+                ChargingVoltage = getIntField(String8(SYSFS_BATTERY_VOLTAGE));
+            } else {
+                path.clear();
+                path.appendFormat("%s/%s/voltage_now", POWER_SUPPLY_SYSFS_PATH,
+                                  mChargerNames[i].c_str());
+                if (access(path.c_str(), R_OK) == 0) {
+                    ChargingVoltage = getIntField(path);
+                }
             }
 
             double power = ((double)ChargingCurrent / MILLION) *
