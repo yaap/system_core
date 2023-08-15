@@ -96,6 +96,9 @@ struct ProcessAttributes {
     std::vector<gid_t> supp_gids;
     int priority;
     bool stdio_to_kmsg;
+    int uclamp_min;
+    int uclamp_max;
+
 };
 
 inline bool RequiresConsole(const ProcessAttributes& attr) {
