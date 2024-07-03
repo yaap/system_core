@@ -404,6 +404,13 @@ on init
     copy /dev/cpuset/mems /dev/cpuset/audio-app/mems
     write /dev/cpuset/audio-app/cpus 0-5
 
+    # ifdef VENDOR_EDIT
+    # wei.wang@ASTI, 2019/10/10, [ITN-829] Improve sf performance
+    mkdir /dev/cpuset/display
+    copy /dev/cpuset/cpus /dev/cpuset/display/cpus
+    copy /dev/cpuset/mems /dev/cpuset/display/mems
+    # endif /* VENDOR_EDIT */
+
     # change permissions for all cpusets we'll touch at runtime
     chown system system /dev/cpuset
     chown system system /dev/cpuset/foreground
@@ -428,6 +435,13 @@ on init
     chown system system /dev/cpuset/top-app/cgroup.procs
     chown system system /dev/cpuset/restricted/cgroup.procs
     chown system system /dev/cpuset/camera-daemon/cgroup.procs
+    chown system system /dev/cpuset/display/cgroup.procs
+    
+    # ifdef VENDOR_EDIT
+    # wei.wang@ASTI, 2019/10/10, [ITN-829] Improve sf performance
+    chown system system /dev/cpuset/display
+    chown system system /dev/cpuset/display/tasks
+    # endif /* VENDOR_EDIT */
 
     # set system-background to 0775 so SurfaceFlinger can touch it
     chmod 0775 /dev/cpuset/system-background
@@ -447,6 +461,7 @@ on init
     chmod 0664 /dev/cpuset/restricted/cgroup.procs
     chmod 0664 /dev/cpuset/cgroup.procs
     chmod 0664 /dev/cpuset/camera-daemon/cgroup.procs
+    chmod 0664 /dev/cpuset/display/cgroup.procs
 
     # make the PSI monitor accessible to others
     chown system system /proc/pressure/memory
@@ -1206,6 +1221,11 @@ on boot
     chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration
     chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
     chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+
+    # ifdef VENDOR_EDIT
+    # alden.zhang@OPTI, 2020/6/5, porting, [ITN-829] Improve sf performance
+    write /dev/cpuset/display/cpus 4-7
+    # endif /* VENDOR_EDIT */
 
     chown system system /sys/class/leds/vibrator/trigger
     chown system system /sys/class/leds/vibrator/activate
