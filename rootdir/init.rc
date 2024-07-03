@@ -402,7 +402,7 @@ on init
     mkdir /dev/cpuset/audio-app
     copy /dev/cpuset/cpus /dev/cpuset/audio-app/cpus
     copy /dev/cpuset/mems /dev/cpuset/audio-app/mems
-    write /dev/cpuset/audio-app/cpus 0-5
+    write /dev/cpuset/audio-app/cpus 1-2
 
     # ifdef VENDOR_EDIT
     # wei.wang@ASTI, 2019/10/10, [ITN-829] Improve sf performance
@@ -436,6 +436,7 @@ on init
     chown system system /dev/cpuset/restricted/cgroup.procs
     chown system system /dev/cpuset/camera-daemon/cgroup.procs
     chown system system /dev/cpuset/display/cgroup.procs
+    chown system system /dev/cpuset/audio-app/cgroup.procs
     
     # ifdef VENDOR_EDIT
     # wei.wang@ASTI, 2019/10/10, [ITN-829] Improve sf performance
@@ -462,6 +463,7 @@ on init
     chmod 0664 /dev/cpuset/cgroup.procs
     chmod 0664 /dev/cpuset/camera-daemon/cgroup.procs
     chmod 0664 /dev/cpuset/display/cgroup.procs
+    chmod 0664 /dev/cpuset/audio-app/cgroup.procs
 
     # make the PSI monitor accessible to others
     chown system system /proc/pressure/memory
