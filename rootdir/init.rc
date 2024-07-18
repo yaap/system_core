@@ -1225,7 +1225,7 @@ on boot
 
     # ifdef VENDOR_EDIT
     # alden.zhang@OPTI, 2020/6/5, porting, [ITN-829] Improve sf performance
-    write /dev/cpuset/display/cpus 4-7
+    write /dev/cpuset/display/cpus 4-6
     # endif /* VENDOR_EDIT */
 
     chown system system /sys/class/leds/vibrator/trigger
