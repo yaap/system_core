@@ -118,7 +118,7 @@ libinit_cc_defaults {
     cflags: [
         "-DALLOW_FIRST_STAGE_CONSOLE=0",
         "-DALLOW_LOCAL_PROP_OVERRIDE=0",
-        "-DALLOW_PERMISSIVE_SELINUX=0",
+        "-DALLOW_PERMISSIVE_SELINUX=1",
         "-DANDROID_BASE_UNIQUE_FD_DISABLE_IMPLICIT_CONVERSION",
         "-DDUMP_ON_UMOUNT_FAILURE=0",
         "-DINIT_FULL_SOURCES",
@@ -405,7 +405,7 @@ init_first_stage_cc_defaults {
         "-Werror",
         "-DALLOW_FIRST_STAGE_CONSOLE=0",
         "-DALLOW_LOCAL_PROP_OVERRIDE=0",
-        "-DALLOW_PERMISSIVE_SELINUX=0",
+        "-DALLOW_PERMISSIVE_SELINUX=1",
         "-DREBOOT_BOOTLOADER_ON_PANIC=0",
         "-DWORLD_WRITABLE_KMSG=0",
         "-DDUMP_ON_UMOUNT_FAILURE=0",
