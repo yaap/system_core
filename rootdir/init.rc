@@ -402,7 +402,6 @@ on init
     mkdir /dev/cpuset/audio-app
     copy /dev/cpuset/cpus /dev/cpuset/audio-app/cpus
     copy /dev/cpuset/mems /dev/cpuset/audio-app/mems
-    write /dev/cpuset/audio-app/cpus 1-2
 
     # ifdef VENDOR_EDIT
     # wei.wang@ASTI, 2019/10/10, [ITN-829] Improve sf performance
@@ -1222,11 +1221,6 @@ on boot
     chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration
     chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
     chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
-
-    # ifdef VENDOR_EDIT
-    # alden.zhang@OPTI, 2020/6/5, porting, [ITN-829] Improve sf performance
-    write /dev/cpuset/display/cpus 4-6
-    # endif /* VENDOR_EDIT */
 
     chown system system /sys/class/leds/vibrator/trigger
     chown system system /sys/class/leds/vibrator/activate
