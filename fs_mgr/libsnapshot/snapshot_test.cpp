@@ -56,14 +56,12 @@
 
 #if defined(LIBSNAPSHOT_TEST_VAB_LEGACY)
 #define DEFAULT_MODE "vab-legacy"
-#elif defined(LIBSNAPSHOT_TEST_VABC_LEGACY)
-#define DEFAULT_MODE "vabc-legacy"
 #else
 #define DEFAULT_MODE ""
 #endif
 
 DEFINE_string(force_mode, DEFAULT_MODE,
-              "Force testing older modes (vab-legacy, vabc-legacy) ignoring device config.");
+              "Force testing older modes (vab-legacy) ignoring device config.");
 DEFINE_string(force_iouring_disable, "",
               "Force testing mode (iouring_disabled) - disable io_uring");
 DEFINE_string(compression_method, "gz", "Default compression algorithm.");
@@ -140,17 +138,10 @@ class SnapshotTest : public ::testing::Test {
     void SetupProperties() {
         std::unordered_map<std::string, std::string> properties;
 
-        ASSERT_TRUE(android::base::SetProperty("snapuserd.test.dm.snapshots", "0"))
-                << "Failed to disable property: virtual_ab.userspace.snapshots.enabled";
         ASSERT_TRUE(android::base::SetProperty("snapuserd.test.io_uring.force_disable", "0"))
                 << "Failed to set property: snapuserd.test.io_uring.disabled";
 
-        if (FLAGS_force_mode == "vabc-legacy") {
-            ASSERT_TRUE(android::base::SetProperty("snapuserd.test.dm.snapshots", "1"))
-                    << "Failed to disable property: virtual_ab.userspace.snapshots.enabled";
-            properties["ro.virtual_ab.compression.enabled"] = "true";
-            properties["ro.virtual_ab.userspace.snapshots.enabled"] = "false";
-        } else if (FLAGS_force_mode == "vab-legacy") {
+        if (FLAGS_force_mode == "vab-legacy") {
             properties["ro.virtual_ab.compression.enabled"] = "false";
             properties["ro.virtual_ab.userspace.snapshots.enabled"] = "false";
         }
@@ -2656,6 +2647,41 @@ TEST_F(SnapshotUpdateTest, BadCowVersion) {
     ASSERT_TRUE(sm->CreateUpdateSnapshots(manifest_));
 }
 
+TEST_F(SnapshotTest, FlagCheck) {
+    if (!snapuserd_required_) {
+        GTEST_SKIP() << "Skipping snapuserd test";
+    }
+    ASSERT_TRUE(AcquireLock());
+
+    SnapshotUpdateStatus status = sm->ReadSnapshotUpdateStatus(lock_.get());
+
+    // Set flags in proto
+    status.set_o_direct(true);
+    status.set_io_uring_enabled(true);
+    status.set_userspace_snapshots(true);
+
+    sm->WriteSnapshotUpdateStatus(lock_.get(), status);
+    // Ensure a connection to the second-stage daemon, but use the first-stage
+    // code paths thereafter.
+    ASSERT_TRUE(sm->EnsureSnapuserdConnected());
+    sm->set_use_first_stage_snapuserd(true);
+
+    auto init = NewManagerForFirstStageMount("_b");
+    ASSERT_NE(init, nullptr);
+
+    lock_ = nullptr;
+
+    std::vector<std::string> snapuserd_argv;
+    ASSERT_TRUE(init->PerformInitTransition(SnapshotManager::InitTransition::SELINUX_DETACH,
+                                            &snapuserd_argv));
+    ASSERT_TRUE(std::find(snapuserd_argv.begin(), snapuserd_argv.end(), "-o_direct") !=
+                snapuserd_argv.end());
+    ASSERT_TRUE(std::find(snapuserd_argv.begin(), snapuserd_argv.end(), "-io_uring") !=
+                snapuserd_argv.end());
+    ASSERT_TRUE(std::find(snapuserd_argv.begin(), snapuserd_argv.end(), "-user_snapshot") !=
+                snapuserd_argv.end());
+}
+
 class FlashAfterUpdateTest : public SnapshotUpdateTest,
                              public WithParamInterface<std::tuple<uint32_t, bool>> {
   public:
@@ -2892,22 +2918,29 @@ int main(int argc, char** argv) {
     ::testing::AddGlobalTestEnvironment(new ::android::snapshot::SnapshotTestEnvironment());
     gflags::ParseCommandLineFlags(&argc, &argv, false);
 
-    android::base::SetProperty("ctl.stop", "snapuserd");
+    bool vab_legacy = false;
+    if (FLAGS_force_mode == "vab-legacy") {
+        vab_legacy = true;
+    }
 
-    std::unordered_set<std::string> modes = {"", "vab-legacy", "vabc-legacy"};
+    if (!vab_legacy) {
+        // This is necessary if the configuration we're testing doesn't match the device.
+        android::base::SetProperty("ctl.stop", "snapuserd");
+        android::snapshot::KillSnapuserd();
+    }
+
+    std::unordered_set<std::string> modes = {"", "vab-legacy"};
     if (modes.count(FLAGS_force_mode) == 0) {
         std::cerr << "Unexpected force_config argument\n";
         return 1;
     }
 
-    // This is necessary if the configuration we're testing doesn't match the device.
-    android::snapshot::KillSnapuserd();
-
     int ret = RUN_ALL_TESTS();
 
-    android::base::SetProperty("snapuserd.test.dm.snapshots", "0");
     android::base::SetProperty("snapuserd.test.io_uring.force_disable", "0");
 
-    android::snapshot::KillSnapuserd();
+    if (!vab_legacy) {
+        android::snapshot::KillSnapuserd();
+    }
     return ret;
 }

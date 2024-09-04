@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Android Open Source Project
+ * Copyright (C) 2024 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,23 +16,22 @@
 
 #pragma once
 
-#include <cstdint>
+#ifndef MEMCG_V2_FORCE_ENABLED
+#define MEMCG_V2_FORCE_ENABLED false
+#endif
 
-#include <processgroup/format/cgroup_controller.h>
+#ifndef CGROUP_V2_SYS_APP_ISOLATION
+#define CGROUP_V2_SYS_APP_ISOLATION false
+#endif
 
-namespace android {
-namespace cgrouprc {
-namespace format {
+namespace android::libprocessgroup_flags {
 
-struct CgroupFile {
-    uint32_t version_;
-    uint32_t controller_count_;
-    CgroupController controllers_[];
+inline consteval bool force_memcg_v2() {
+    return MEMCG_V2_FORCE_ENABLED;
+}
 
-    static constexpr uint32_t FILE_VERSION_1 = 1;
-    static constexpr uint32_t FILE_CURR_VERSION = FILE_VERSION_1;
-};
+inline consteval bool cgroup_v2_sys_app_isolation() {
+    return CGROUP_V2_SYS_APP_ISOLATION;
+}
 
-}  // namespace format
-}  // namespace cgrouprc
-}  // namespace android
+}  // namespace android::libprocessgroup_flags

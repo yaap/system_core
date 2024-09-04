@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Android Open Source Project
+ * Copyright (C) 2024 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,23 +16,10 @@
 
 #pragma once
 
-#include <cstdint>
+namespace android::statssocket::lazy {
 
-#include <processgroup/format/cgroup_controller.h>
+// See if libstatssocket.so is available. Early processes relying on _lazy might not have access
+// to libstatssocket.so when they start before the StatsD APEX is available.
+bool IsAvailable();
 
-namespace android {
-namespace cgrouprc {
-namespace format {
-
-struct CgroupFile {
-    uint32_t version_;
-    uint32_t controller_count_;
-    CgroupController controllers_[];
-
-    static constexpr uint32_t FILE_VERSION_1 = 1;
-    static constexpr uint32_t FILE_CURR_VERSION = FILE_VERSION_1;
-};
-
-}  // namespace format
-}  // namespace cgrouprc
-}  // namespace android
+}  // namespace android::statssocket::lazy
