@@ -319,19 +319,7 @@ cc_library_static {
             cflags: ["-DROOT_POSSIBLE"],
         },
 
-        malloc_use_scudo: {
-            cflags: ["-DUSE_SCUDO"],
-            whole_static_libs: ["libscudo"],
-            srcs: ["libdebuggerd/scudo.cpp"],
-            header_libs: ["scudo_headers"],
-        },
-
         malloc_low_memory: {
-            cflags: ["-UUSE_SCUDO"],
-            exclude_static_libs: ["libscudo"],
-        },
-
-        malloc_use_jemalloc: {
             cflags: ["-UUSE_SCUDO"],
             exclude_static_libs: ["libscudo"],
         },
