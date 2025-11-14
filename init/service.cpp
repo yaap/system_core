@@ -683,6 +683,13 @@ Result<void> Service::Start() {
         return result;
     }
 
+    auto expanded_path = ExpandProps(args_[0]);
+    if (!expanded_path.ok()) {
+        flags_ |= SVC_DISABLED;
+        return ErrnoError() << "Cannot expand path: " << expanded_path.error();
+    }
+    args_[0] = *expanded_path;
+
     struct stat sb;
     if (stat(args_[0].c_str(), &sb) == -1) {
         flags_ |= SVC_DISABLED;

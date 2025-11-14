@@ -1052,43 +1052,29 @@ int64_t get_sparse_limit(int64_t size, const FlashingPlan* fp) {
     return 0;
 }
 
-static bool load_buf_fd(unique_fd fd, struct fastboot_buffer* buf, const FlashingPlan* fp) {
-    int64_t sz = get_file_size(fd);
-    if (sz == -1) {
+static bool load_buf_fd(unique_fd fd, struct fastboot_buffer* buf) {
+    buf->sz = get_file_size(fd);
+    if (buf->sz == -1) {
         return false;
     }
 
-    if (sparse_file* s = sparse_file_import(fd.get(), false, false)) {
-        buf->image_size = sparse_file_len(s, false, false);
+    if (SparsePtr s(sparse_file_import(fd.get(), false, false), sparse_file_destroy); s) {
+        buf->image_size = sparse_file_len(s.get(), false, false);
         if (buf->image_size < 0) {
             LOG(ERROR) << "Could not compute length of sparse file";
             return false;
         }
-        sparse_file_destroy(s);
         buf->file_type = FB_BUFFER_SPARSE;
     } else {
-        buf->image_size = sz;
+        buf->image_size = buf->sz;
         buf->file_type = FB_BUFFER_FD;
     }
 
-    lseek(fd.get(), 0, SEEK_SET);
-    int64_t limit = get_sparse_limit(sz, fp);
     buf->fd = std::move(fd);
-    if (limit) {
-        buf->files = load_sparse_files(buf->fd.get(), limit);
-        if (buf->files.empty()) {
-            return false;
-        }
-        buf->type = FB_BUFFER_SPARSE;
-    } else {
-        buf->type = FB_BUFFER_FD;
-        buf->sz = sz;
-    }
-
     return true;
 }
 
-static bool load_buf(const char* fname, struct fastboot_buffer* buf, const FlashingPlan* fp) {
+static bool load_buf(const char* fname, struct fastboot_buffer* buf) {
     unique_fd fd(TEMP_FAILURE_RETRY(open(fname, O_RDONLY | O_BINARY)));
 
     if (fd == -1) {
@@ -1104,7 +1090,7 @@ static bool load_buf(const char* fname, struct fastboot_buffer* buf, const Flash
         return false;
     }
 
-    return load_buf_fd(std::move(fd), buf, fp);
+    return load_buf_fd(std::move(fd), buf);
 }
 
 static void rewrite_vbmeta_buffer(struct fastboot_buffer* buf, bool vbmeta_in_boot) {
@@ -1199,10 +1185,10 @@ static uint64_t get_partition_size(const std::string& partition) {
     return partition_size;
 }
 
-static void copy_avb_footer(const ImageSource* source, const std::string& partition,
+static void copy_avb_footer(const FlashingPlan* fp, const std::string& partition,
                             struct fastboot_buffer* buf) {
     if (buf->sz < AVB_FOOTER_SIZE || is_logical(partition) ||
-        should_flash_in_userspace(source, partition)) {
+        should_flash_in_userspace(fp->source.get(), partition)) {
         return;
     }
 
@@ -1268,9 +1254,9 @@ void flash_partition_files(const std::string& partition, const std::vector<Spars
     }
 }
 
-static void flash_buf(const ImageSource* source, const std::string& partition,
+static void flash_buf(const FlashingPlan* fp, const std::string& partition,
                       struct fastboot_buffer* buf, const bool apply_vbmeta) {
-    copy_avb_footer(source, partition, buf);
+    copy_avb_footer(fp, partition, buf);
 
     // Rewrite vbmeta if that's what we're flashing and modification has been requested.
     if (g_disable_verity || g_disable_verification) {
@@ -1284,16 +1270,15 @@ static void flash_buf(const ImageSource* source, const std::string& partition,
         }
     }
 
-    switch (buf->type) {
-        case FB_BUFFER_SPARSE: {
-            flash_partition_files(partition, buf->files);
-            break;
+    lseek(buf->fd.get(), 0, SEEK_SET);
+    if (int64_t limit = get_sparse_limit(buf->sz, fp)) {
+        auto files = load_sparse_files(buf->fd.get(), limit);
+        if (files.empty()) {
+            LOG(FATAL) << "Failed to resparse image for partition: " << partition;
         }
-        case FB_BUFFER_FD:
-            fb->FlashPartition(partition, buf->fd, buf->sz);
-            break;
-        default:
-            die("unknown buffer type: %d", buf->type);
+        flash_partition_files(partition, files);
+    } else {
+        fp->fb->FlashPartition(partition, buf->fd, buf->sz);
     }
 }
 
@@ -1483,7 +1468,7 @@ static std::string repack_ramdisk(const char* pname, struct fastboot_buffer* buf
         !android::base::StartsWith(pname_sv, "vendor_boot_b:")) {
         return std::string(pname_sv);
     }
-    if (buf->type != FB_BUFFER_FD) {
+    if (buf->file_type != FB_BUFFER_FD) {
         die("Flashing sparse vendor ramdisk image is not supported.");
     }
     if (buf->sz <= 0) {
@@ -1493,11 +1478,11 @@ static std::string repack_ramdisk(const char* pname, struct fastboot_buffer* buf
     std::string ramdisk(pname_sv.substr(pname_sv.find(':') + 1));
 
     if (!g_dtb_path.empty()) {
-        if (!load_buf(g_dtb_path.c_str(), &dtb_buf, nullptr)) {
+        if (!load_buf(g_dtb_path.c_str(), &dtb_buf)) {
             die("cannot load '%s': %s", g_dtb_path.c_str(), strerror(errno));
         }
 
-        if (dtb_buf.type != FB_BUFFER_FD) {
+        if (dtb_buf.file_type != FB_BUFFER_FD) {
             die("Flashing sparse vendor ramdisk image with dtb is not supported.");
         }
         if (dtb_buf.sz <= 0) {
@@ -1531,7 +1516,7 @@ void do_flash(const char* pname, const char* fname, const bool apply_vbmeta,
 
     if (fp->source) {
         unique_fd fd = fp->source->OpenFile(fname);
-        if (fd < 0 || !load_buf_fd(std::move(fd), &buf, fp)) {
+        if (fd < 0 || !load_buf_fd(std::move(fd), &buf)) {
             die("could not load '%s': %s", fname, strerror(errno));
         }
         std::vector<char> signature_data;
@@ -1541,7 +1526,7 @@ void do_flash(const char* pname, const char* fname, const bool apply_vbmeta,
             fb->Download("signature", signature_data);
             fb->RawCommand("signature", "installing signature");
         }
-    } else if (!load_buf(fname, &buf, fp)) {
+    } else if (!load_buf(fname, &buf)) {
         die("cannot load '%s': %s", fname, strerror(errno));
     }
 
@@ -1549,7 +1534,7 @@ void do_flash(const char* pname, const char* fname, const bool apply_vbmeta,
         fb->ResizePartition(pname, std::to_string(buf.image_size));
     }
     std::string flash_pname = repack_ramdisk(pname, &buf, fp->fb);
-    flash_buf(fp->source.get(), flash_pname, &buf, apply_vbmeta);
+    flash_buf(fp, flash_pname, &buf, apply_vbmeta);
 }
 
 // Sets slot_override as the active slot. If slot_override is blank,
@@ -1942,7 +1927,7 @@ void FlashAllTool::AddFlashTasks(const std::vector<std::pair<const Image*, std::
     for (const auto& [image, slot] : images) {
         fastboot_buffer buf;
         unique_fd fd = fp_->source->OpenFile(image->img_name);
-        if (fd < 0 || !load_buf_fd(std::move(fd), &buf, fp_)) {
+        if (fd < 0 || !load_buf_fd(std::move(fd), &buf)) {
             if (image->optional_if_no_image) {
                 continue;
             }
@@ -2101,11 +2086,11 @@ void fb_perform_format(const std::string& partition, int skip_if_not_supported,
     if (fd == -1) {
         die("Cannot open generated image: %s", strerror(errno));
     }
-    if (!load_buf_fd(std::move(fd), &buf, fp)) {
+    if (!load_buf_fd(std::move(fd), &buf)) {
         die("Cannot read image: %s", strerror(errno));
     }
 
-    flash_buf(fp->source.get(), partition, &buf, is_vbmeta_partition(partition));
+    flash_buf(fp, partition, &buf, is_vbmeta_partition(partition));
     return;
 
 failed:
@@ -2566,7 +2551,7 @@ int FastBootTool::Main(int argc, char* argv[]) {
             std::string filename = next_arg(&args);
 
             struct fastboot_buffer buf;
-            if (!load_buf(filename.c_str(), &buf, fp.get()) || buf.type != FB_BUFFER_FD) {
+            if (!load_buf(filename.c_str(), &buf) || buf.file_type != FB_BUFFER_FD) {
                 die("cannot load '%s'", filename.c_str());
             }
             fb->Download(filename, buf.fd.get(), buf.sz);

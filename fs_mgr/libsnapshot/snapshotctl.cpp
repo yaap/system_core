@@ -173,7 +173,7 @@ bool MapSnapshots::PrepareUpdate() {
 
     auto source_slot = fs_mgr_get_slot_suffix();
     auto source_slot_number = SlotNumberForSlotSuffix(source_slot);
-    auto super_source = fs_mgr_get_super_partition_name(source_slot_number);
+    auto super_source = fs_mgr_get_super_partition_name();
 
     // Get current partition information.
     PartitionOpener opener;
@@ -281,6 +281,8 @@ bool MapSnapshots::GetCowDevicePath(std::string partition_name, std::string* cow
 }
 
 bool MapSnapshots::ApplyUpdate() {
+    auto scope_guard = android::base::make_scope_guard([]() { UmountScratch(false); });
+
     if (!PrepareUpdate()) {
         LOG(ERROR) << "PrepareUpdate failed";
         return false;
@@ -649,6 +651,12 @@ bool ApplyUpdate(int argc, char** argv) {
             metadata_on_super = true;
         }
     }
+
+    if (!std::filesystem::exists(path) || std::filesystem::is_empty(path)) {
+        LOG(ERROR) << path << " doesn't exist";
+        return false;
+    }
+
     MapSnapshots cow(path, metadata_on_super);
     if (!cow.ApplyUpdate()) {
         return false;
@@ -921,6 +929,11 @@ bool MapPrecreatedSnapshots(int argc, char** argv) {
     std::string path = std::string(argv[2]);
     std::vector<std::string> patchfiles;
 
+    if (!std::filesystem::exists(path) || std::filesystem::is_empty(path)) {
+        LOG(ERROR) << path << " doesn't exist";
+        return false;
+    }
+
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
         if (android::base::EndsWith(entry.path().generic_string(), ".patch")) {
             patchfiles.push_back(android::base::Basename(entry.path().generic_string()));
@@ -987,7 +1000,7 @@ bool CreateTestUpdate(SnapshotManager* sm) {
     auto source_slot_number = SlotNumberForSlotSuffix(source_slot);
     auto target_slot = fs_mgr_get_other_slot_suffix();
     auto target_slot_number = SlotNumberForSlotSuffix(target_slot);
-    auto super_source = fs_mgr_get_super_partition_name(source_slot_number);
+    auto super_source = fs_mgr_get_super_partition_name();
 
     // Get current partition information.
     PartitionOpener opener;
@@ -1019,7 +1032,7 @@ bool CreateTestUpdate(SnapshotManager* sm) {
     // Write the "new" system partition.
     auto system_target_name = "system" + target_slot;
     CreateLogicalPartitionParams clpp = {
-            .block_device = fs_mgr_get_super_partition_name(target_slot_number),
+            .block_device = fs_mgr_get_super_partition_name(),
             .metadata_slot = {target_slot_number},
             .partition_name = system_target_name,
             .timeout_ms = 10s,

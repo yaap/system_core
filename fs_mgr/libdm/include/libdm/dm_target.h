@@ -309,7 +309,7 @@ class DmTargetDefaultKey final : public DmTarget {
           blockdev_(blockdev),
           start_sector_(start_sector) {}
 
-    std::string name() const override { return kName; }
+    std::string name() const override { return "default-key"; }
     bool Valid() const override;
     std::string GetParameterString() const override;
     void SetUseLegacyOptionsFormat() { use_legacy_options_format_ = true; }
@@ -317,8 +317,6 @@ class DmTargetDefaultKey final : public DmTarget {
     void SetWrappedKeyV0() { is_hw_wrapped_ = true; }
 
   private:
-    inline static const std::string kName = "default-key";
-
     std::string cipher_;
     std::string key_;
     std::string blockdev_;

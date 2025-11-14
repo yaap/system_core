@@ -82,6 +82,7 @@ init_device_sources = [
     "switch_root.cpp",
     "tradeinmode.cpp",
     "uevent_listener.cpp",
+    "uevent_dependency_graph.cpp",
     "ueventd.cpp",
     "ueventd_parser.cpp",
 ]
@@ -171,6 +172,7 @@ libinit_cc_defaults {
         },
     },
     static_libs: [
+        "libapexd_flags",
         "libavb",
         "libavf_cc_flags",
         "libbootloader_message",
@@ -185,7 +187,6 @@ libinit_cc_defaults {
         "libsnapshot_cow",
         "libsnapshot_init",
         "libxml2",
-        "lib_apex_manifest_proto_lite",
         "update_metadata-protos",
         "libgenfslabelsversion.ffi",
     ],
@@ -377,6 +378,7 @@ init_first_stage_cc_defaults {
     ],
 
     static_libs: [
+        "libapexd_flags",
         "libfs_avb",
         "libavf_cc_flags",
         "libfs_mgr",
@@ -414,6 +416,7 @@ init_first_stage_cc_defaults {
         "-Wall",
         "-Wextra",
         "-Wno-unused-parameter",
+        "-Wexit-time-destructors",
         "-Werror",
         "-DALLOW_FIRST_STAGE_CONSOLE=0",
         "-DALLOW_LOCAL_PROP_OVERRIDE=0",
@@ -521,6 +524,8 @@ cc_test {
         "service_test.cpp",
         "subcontext_test.cpp",
         "tokenizer_test.cpp",
+        "uevent_dependency_graph.cpp",
+        "uevent_dependency_graph_test.cpp",
         "ueventd_parser_test.cpp",
         "ueventd_test.cpp",
         "util_test.cpp",
@@ -608,18 +613,18 @@ cc_defaults {
         "-Werror",
     ],
     static_libs: [
-        "libbase",
         "libfstab",
-        "libselinux",
         "libpropertyinfoserializer",
         "libpropertyinfoparser",
     ],
     whole_static_libs: ["libcap"],
     shared_libs: [
+        "libbase",
         "libcutils",
         "liblog",
         "libprocessgroup",
         "libprotobuf-cpp-lite",
+        "libselinux",
     ],
     proto: {
         type: "lite",

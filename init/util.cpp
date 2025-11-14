@@ -689,7 +689,7 @@ bool Has32BitAbi() {
 }
 
 std::string GetApexNameFromFileName(const std::string& path) {
-    static const std::string kApexDir = "/apex/";
+    [[clang::no_destroy]] static const std::string kApexDir = "/apex/";
     if (StartsWith(path, kApexDir)) {
         auto begin = kApexDir.size();
         auto end = path.find('/', begin);

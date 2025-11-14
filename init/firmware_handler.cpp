@@ -134,9 +134,17 @@ ExternalFirmwareHandler::ExternalFirmwareHandler(std::string devpath, uid_t uid,
     : ExternalFirmwareHandler(devpath, uid, 0, handler_path) {}
 
 FirmwareHandler::FirmwareHandler(std::vector<std::string> firmware_directories,
-                                 std::vector<ExternalFirmwareHandler> external_firmware_handlers)
+                                 std::vector<ExternalFirmwareHandler> external_firmware_handlers,
+                                 bool serial_handler_after_coldboot)
     : firmware_directories_(std::move(firmware_directories)),
-      external_firmware_handlers_(std::move(external_firmware_handlers)) {}
+      external_firmware_handlers_(std::move(external_firmware_handlers)),
+      serial_handler_after_coldboot_(serial_handler_after_coldboot) {}
+
+void FirmwareHandler::ColdbootDone() {
+    if (serial_handler_after_coldboot_) {
+        enables_parallel_handlers_ = false;
+    }
+}
 
 std::string FirmwareHandler::GetFirmwarePath(const Uevent& uevent) const {
     for (const auto& external_handler : external_firmware_handlers_) {
@@ -265,21 +273,31 @@ bool FirmwareHandler::ForEachFirmwareDirectory(
     return false;
 }
 
+void FirmwareHandler::HandleUeventInternal(const Uevent& uevent) const {
+    Timer t;
+    auto firmware = GetFirmwarePath(uevent);
+    ProcessFirmwareEvent(uevent.path, firmware);
+    LOG(INFO) << "loading " << uevent.path << " took " << t;
+}
+
 void FirmwareHandler::HandleUevent(const Uevent& uevent) {
     if (uevent.subsystem != "firmware" || uevent.action != "add") return;
 
-    // Loading the firmware in a child means we can do that in parallel...
-    auto pid = fork();
-    if (pid == -1) {
-        PLOG(ERROR) << "could not fork to process firmware event for " << uevent.firmware;
+    if (enables_parallel_handlers_) {
+        // Loading the firmware in a child means we can do that in parallel...
+        auto pid = fork();
+        if (pid == -1) {
+            PLOG(ERROR) << "could not fork to process firmware event for " << uevent.firmware;
+        } else if (pid == 0) {
+            // Child does the actual work
+            HandleUeventInternal(uevent);
+            _exit(EXIT_SUCCESS);
+        } else {
+            // The main process returns here. Let the child do the actual work in parallel.
+            return;
+        }
     }
-    if (pid == 0) {
-        Timer t;
-        auto firmware = GetFirmwarePath(uevent);
-        ProcessFirmwareEvent(uevent.path, firmware);
-        LOG(INFO) << "loading " << uevent.path << " took " << t;
-        _exit(EXIT_SUCCESS);
-    }
+    HandleUeventInternal(uevent);
 }
 
 }  // namespace init

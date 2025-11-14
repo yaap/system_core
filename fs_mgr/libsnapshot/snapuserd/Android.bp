@@ -283,6 +283,12 @@ cc_test {
     test_options: {
         // VABC mandatory in Android T per VSR.
         min_shipping_api_level: 32,
+        test_runner_options: [
+            {
+                name: "native-test-timeout",
+                value: "5m",
+            },
+        ],
     },
 }
 

@@ -26,6 +26,7 @@
 
 #include <android-base/unique_fd.h>
 
+#include <atomic>
 #include <unordered_map>
 #include <utility>
 
@@ -479,7 +480,7 @@ private:
 
     // Whether we are currently waiting for work.  Not protected by a lock,
     // any use of it is racy anyway.
-    volatile bool mPolling;
+    std::atomic<bool> mPolling;
 
     android::base::unique_fd mEpollFd;  // guarded by mLock but only modified on the looper thread
     bool mEpollRebuildRequired; // guarded by mLock

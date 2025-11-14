@@ -50,9 +50,11 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/thread_annotations.h>
+#include <com_android_apex_flags.h>
 #include <fs_avb/fs_avb.h>
 #include <fs_mgr_vendor_overlay.h>
 #include <libavb/libavb.h>
+#include <libdm/loop_control.h>
 #include <libgsi/libgsi.h>
 #include <libsnapshot/snapshot.h>
 #include <logwrap/logwrap.h>
@@ -128,8 +130,8 @@ struct PendingControlMessage {
     pid_t pid;
     int fd;
 };
-static std::mutex pending_control_messages_lock;
-static std::queue<PendingControlMessage> pending_control_messages;
+[[clang::no_destroy]] static std::mutex pending_control_messages_lock;
+[[clang::no_destroy]] static std::queue<PendingControlMessage> pending_control_messages;
 
 // Init epolls various FDs to wait for various inputs.  It previously waited on property changes
 // with a blocking socket that contained the information related to the change, however, it was easy
@@ -236,7 +238,7 @@ void ResetWaitForProp() {
     prop_waiter_state.ResetWaitForProp();
 }
 
-static class ShutdownState {
+[[clang::no_destroy]] static class ShutdownState {
   public:
     void TriggerShutdown(const std::string& command) {
         // We can't call HandlePowerctlMessage() directly in this function,
@@ -369,6 +371,12 @@ void PropertyChanged(const std::string& name, const std::string& value) {
     // commands to be executed.
     if (name == "sys.powerctl") {
         trigger_shutdown(value);
+    } else if (name == "sys.shutdown.requested") {
+        // Higher layers send "sys.shutdown.requested" before they're ready to ask the init
+        // system to shutdown via the above "sys.powerctl". Use the early warning to start
+        // the watchdog so that if higher layers hang before setting "sys.powerctl" we
+        // don't end up hung.
+        HandleShutdownRequestedMessage(value);
     }
 
     if (property_triggers_enabled) {
@@ -507,6 +515,7 @@ using ControlMessageFunction = std::function<Result<void>(Service*)>;
 
 static const std::map<std::string, ControlMessageFunction, std::less<>>& GetControlMessageMap() {
     // clang-format off
+    [[clang::no_destroy]]
     static const std::map<std::string, ControlMessageFunction, std::less<>> control_message_functions = {
         {"sigstop_on",        [](auto* service) { service->set_sigstop(true); return Result<void>{}; }},
         {"sigstop_off",       [](auto* service) { service->set_sigstop(false); return Result<void>{}; }},
@@ -853,6 +862,22 @@ static void MountExtraFilesystems() {
 #undef CHECKCALL
 }
 
+static void InitExtraDevices() {
+    if constexpr (com::android::apex::flags::mount_before_data()) {
+        // Pre-create a bunch of loop devices to accelerate apexd later. This effectively overrides
+        // CONFIG_BLK_DEV_LOOP_MIN_COUNT. 128 loop devices should be enough for now because most
+        // devices have < 100 apexes.
+        constexpr int kMaxLoopDevices = 128;
+        // Fire off a thread to pre-create the loop devices to avoid blocking the init.
+        std::thread([]() {
+            dm::LoopControl loop_control;
+            for (int i = 0; i < kMaxLoopDevices; i++) {
+                (void)loop_control.Add(i);
+            }
+        }).detach();
+    }
+}
+
 static void RecordStageBoottimes(const boot_clock::time_point& second_stage_start_time) {
     int64_t first_stage_start_time_ns = -1;
     if (auto first_stage_start_time_str = getenv(kEnvFirstStageStartedAt);
@@ -1048,6 +1073,11 @@ int SecondStageMain(int argc, char** argv) {
     InstallInitNotifier(&epoll);
     StartPropertyService(&property_fd);
 
+    // Initialize extra devices required during second stage init.
+    // This may spawn threads for background work. Hence, this should be after
+    // InstallSignalFdHandler() which needs to be called before spawning any threads.
+    InitExtraDevices();
+
     // If boot_timeout property has been set in a debug build, start the boot monitor
     if (GetBoolProperty("ro.debuggable", false)) {
         int timeout = GetIntProperty("ro.boot.boot_timeout", 0);
@@ -1184,6 +1214,10 @@ int SecondStageMain(int argc, char** argv) {
         if (next_action_time != far_future) {
             epoll_timeout = std::chrono::ceil<std::chrono::milliseconds>(
                     std::max(next_action_time - boot_clock::now(), 0ns));
+        } else {
+            // If we are unlikely to do anything soon, release memory from the
+            // allocator.
+            mallopt(M_PURGE_ALL, 0);
         }
         auto epoll_result = epoll.Wait(epoll_timeout);
         if (!epoll_result.ok()) {

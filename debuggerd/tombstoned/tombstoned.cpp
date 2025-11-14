@@ -54,11 +54,6 @@ using android::base::unique_fd;
 
 static InterceptManager* intercept_manager;
 
-enum CrashStatus {
-  kCrashStatusRunning,
-  kCrashStatusQueued,
-};
-
 struct CrashArtifact {
   unique_fd fd;
 

@@ -407,7 +407,9 @@ static int send_ufs_rpmb_req(int sg_fd, const struct storage_rpmb_send_req* req,
      * receive an async notification that the service is started to avoid
      * blocking (see main).
      */
+    watch_progress(watcher, "rpmb ufs acquire wake_lock");
     wl_rc = acquire_wake_lock(PARTIAL_WAKE_LOCK, UFS_WAKE_LOCK_NAME);
+    watch_progress(watcher, "rpmb ufs acquire wake_lock done");
     if (wl_rc < 0) {
         ALOGE("%s: failed to acquire wakelock: %d, %s\n", __func__, wl_rc, strerror(errno));
         return wl_rc;
@@ -476,7 +478,9 @@ static int send_ufs_rpmb_req(int sg_fd, const struct storage_rpmb_send_req* req,
     }
 
 err_op:
+    watch_progress(watcher, "rpmb ufs release wake_lock");
     wl_rc = release_wake_lock(UFS_WAKE_LOCK_NAME);
+    watch_progress(watcher, "rpmb ufs release wake_lock done");
     if (wl_rc < 0) {
         ALOGE("%s: failed to release wakelock: %d, %s\n", __func__, wl_rc, strerror(errno));
     }

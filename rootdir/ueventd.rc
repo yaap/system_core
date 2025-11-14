@@ -79,6 +79,10 @@ subsystem vfio
 /dev/kvm                  0666   root       root
 /dev/vhost-vsock          0666   root       root
 
+# apexd creates DM for downloaded APEX files, which should be readable by
+# system_server (PackageManager).
+/dev/block/dm-*           0640   root       system
+
 # sysfs properties
 /sys/devices/platform/trusty.*      trusty_version        0440  root   log
 /sys/devices/virtual/input/input*   enable      0660  root   input

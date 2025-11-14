@@ -316,5 +316,15 @@ bool KernelSupportsCompressedSnapshots() {
     return dm.GetTargetByName("user", nullptr);
 }
 
+static bool IsDebuggable() {
+    return android::base::GetBoolProperty("ro.debuggable", false);
+}
+
+bool GetDebugFlag(const std::string& flag) {
+    auto fetcher = IPropertyFetcher::GetInstance();
+    std::string prop_name = "persist.virtual_ab.testing." + flag;
+    return IsDebuggable() && fetcher->GetBoolProperty(prop_name, false);
+}
+
 }  // namespace snapshot
 }  // namespace android

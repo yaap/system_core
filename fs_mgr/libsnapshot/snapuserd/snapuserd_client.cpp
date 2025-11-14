@@ -190,7 +190,8 @@ bool SnapuserdClient::WaitForDeviceDelete(const std::string& control_device) {
     }
     std::string response = Receivemsg();
     if (response != "success") {
-        LOG(ERROR) << "Failed waiting to delete device " << control_device;
+        LOG(ERROR) << "Failed waiting to delete device " << control_device << " received:'"
+                   << response << "'";
         return false;
     }
     return true;
@@ -214,7 +215,7 @@ std::string SnapuserdClient::Receivemsg() {
         return {};
     }
     if (ret == 0) {
-        LOG(DEBUG) << "Snapuserd:client disconnected";
+        LOG(INFO) << "Snapuserd:client disconnected";
         return {};
     }
     return std::string(msg, ret);

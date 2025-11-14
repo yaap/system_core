@@ -44,6 +44,7 @@
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
+#include <build_flags.h>
 #include <cutils/android_filesystem_config.h>
 #include <processgroup/processgroup.h>
 #include <task_profiles.h>
@@ -298,6 +299,16 @@ void removeAllEmptyProcessGroups() {
     if (CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &path)) {
         cgroups.push_back(path);
     }
+    if (android::libprocessgroup_flags::cgroup_v2_sys_app_isolation()) {
+        for (const char* sub : {"apps", "system"}) {
+            std::string subpath = path + "/" + sub;
+            struct stat st;
+            if (stat(subpath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                cgroups.push_back(subpath);
+            }
+        }
+    }
+
     if (CgroupGetMemcgAppsPath(&memcg_apps_path) && memcg_apps_path != path) {
         cgroups.push_back(memcg_apps_path);
     }

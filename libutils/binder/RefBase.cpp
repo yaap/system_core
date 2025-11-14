@@ -455,6 +455,10 @@ void RefBase::incStrong(const void* id) const
     refs->addStrongRef(id);
     const int32_t c = refs->mStrong.fetch_add(1, std::memory_order_relaxed);
     ALOG_ASSERT(c > 0, "incStrong() called on %p after last strong ref", refs);
+    LOG_ALWAYS_FATAL_IF(BAD_STRONG(c),
+                        "incStrong() called on %p too many times,"
+                        " strong refs = %d ",
+                        refs, c);
 #if PRINT_REFS
     ALOGD("incStrong of %p from %p: cnt=%d\n", this, id, c);
 #endif
@@ -563,6 +567,8 @@ void RefBase::weakref_type::incWeak(const void* id)
     const int32_t c __unused = impl->mWeak.fetch_add(1,
             std::memory_order_relaxed);
     ALOG_ASSERT(c >= 0, "incWeak called on %p after last weak ref", this);
+    LOG_ALWAYS_FATAL_IF(c != 0 && BAD_WEAK(c),
+                        "incWeak called on %p too many times, weak refs = %d", this, c);
 }
 
 void RefBase::weakref_type::incWeakRequireWeak(const void* id)

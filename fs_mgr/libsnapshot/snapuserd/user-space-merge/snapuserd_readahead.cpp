@@ -17,6 +17,7 @@
 #include "snapuserd_readahead.h"
 
 #include <pthread.h>
+#include <sys/prctl.h>
 
 #include "android-base/properties.h"
 #include "snapuserd_core.h"
@@ -341,8 +342,8 @@ bool ReadAhead::ReadAheadAsyncIO() {
             // Submit the IO for all the COW ops in a single syscall
             int ret = io_uring_submit(ring_.get());
             if (ret != pending_ios_to_submit) {
-                SNAP_PLOG(ERROR) << "io_uring_submit failed for read-ahead: "
-                                 << " io submit: " << ret << " expected: " << pending_ios_to_submit;
+                SNAP_PLOG(ERROR) << "io_uring_submit failed for read-ahead: " << " io submit: "
+                                 << ret << " expected: " << pending_ios_to_submit;
                 return false;
             }
 
@@ -777,7 +778,8 @@ void ReadAhead::FinalizeIouring() {
 bool ReadAhead::RunThread() {
     SNAP_LOG(INFO) << "ReadAhead thread started.";
 
-    pthread_setname_np(pthread_self(), "ReadAhead");
+    std::string thread_name = "RA_" + misc_name_;
+    prctl(PR_SET_NAME, thread_name.c_str());
 
     if (!InitializeFds()) {
         return false;
@@ -797,14 +799,30 @@ bool ReadAhead::RunThread() {
         SNAP_PLOG(ERROR) << "Failed to set thread priority";
     }
 
-    if (!SetProfiles({"CPUSET_SP_BACKGROUND"})) {
-        SNAP_PLOG(ERROR) << "Failed to assign task profile to readahead thread";
-    }
+    SNAP_LOG(INFO) << "ReadAhead processing: " << thread_name;
 
-    SNAP_LOG(INFO) << "ReadAhead processing.";
+    bool set_profiles = false;
+    // having bools store these values will help up avoid unnecessary GetProperty() calls which is
+    // important as this loop is very busy
+    bool should_set_profiles =
+            android::base::GetBoolProperty("ro.virtual_ab.set_task_profiles", false);
+    bool finished_boot = false;
     while (!RAIterDone()) {
         if (!ReadAheadIOStart()) {
             break;
+        }
+
+        if (!finished_boot &&
+            !(finished_boot = android::base::GetBoolProperty("sys.boot_completed", false))) {
+            continue;
+        }
+
+        if (should_set_profiles && !set_profiles) {
+            if (!SetProfiles({"CPUSET_SP_BACKGROUND"})) {
+                SNAP_LOG(ERROR) << "Failed to assign task profile to readahead thread: "
+                                << thread_name;
+            }
+            set_profiles = true;
         }
     }
 

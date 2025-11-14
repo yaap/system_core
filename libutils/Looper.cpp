@@ -19,6 +19,7 @@
 
 #include <utils/Looper.h>
 
+#include <atomic>
 #include <sys/eventfd.h>
 #include <cinttypes>
 
@@ -216,13 +217,13 @@ int Looper::pollInner(int timeoutMillis) {
     mResponseIndex = 0;
 
     // We are about to idle.
-    mPolling = true;
+    std::atomic_store_explicit(&mPolling, true, std::memory_order_relaxed);
 
     struct epoll_event eventItems[EPOLL_MAX_EVENTS];
     int eventCount = epoll_wait(mEpollFd.get(), eventItems, EPOLL_MAX_EVENTS, timeoutMillis);
 
     // No longer idling.
-    mPolling = false;
+    std::atomic_store_explicit(&mPolling, false, std::memory_order_relaxed);
 
     // Acquire lock.
     mLock.lock();
@@ -673,7 +674,7 @@ void Looper::removeMessages(const sp<MessageHandler>& handler, int what) {
 }
 
 bool Looper::isPolling() const {
-    return mPolling;
+    return std::atomic_load_explicit(&mPolling, std::memory_order_relaxed);
 }
 
 uint32_t Looper::Request::getEpollEvents() const {

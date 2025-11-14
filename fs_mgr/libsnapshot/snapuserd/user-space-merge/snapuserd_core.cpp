@@ -48,7 +48,7 @@ SnapshotHandler::SnapshotHandler(std::string misc_name, std::string cow_device,
 }
 
 bool SnapshotHandler::InitializeWorkers() {
-    for (int i = 0; i < num_worker_threads_; i++) {
+    for (int i = 0; i < handler_options_.num_worker_threads; i++) {
         auto wt = std::make_unique<ReadWorker>(cow_device_, backing_store_device_, misc_name_,
                                                base_path_merge_, GetSharedPtr(),
                                                block_server_opener_, handler_options_.o_direct);
@@ -323,7 +323,7 @@ bool SnapshotHandler::Start() {
     // Now that the worker threads are up, scan the partitions.
     // If the snapshot-merge is being resumed, there is no need to scan as the
     // current slot is already marked as boot complete.
-    if (perform_verification_ && !resume_merge_) {
+    if (!handler_options_.skip_verification && !resume_merge_) {
         update_verify_->VerifyUpdatePartition();
     }
 

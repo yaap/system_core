@@ -58,8 +58,6 @@ using namespace android::storage_literals;
 static constexpr size_t PAYLOAD_BUFFER_SZ = (1UL << 20);
 static_assert(PAYLOAD_BUFFER_SZ >= BLOCK_SZ);
 
-static constexpr int kNumWorkerThreads = 4;
-
 #define SNAP_LOG(level) LOG(level) << misc_name_ << ": "
 #define SNAP_PLOG(level) PLOG(level) << misc_name_ << ": "
 
@@ -245,8 +243,6 @@ class SnapshotHandler : public std::enable_shared_from_this<SnapshotHandler> {
     bool merge_monitored_ = false;
     bool attached_ = false;
     bool scratch_space_ = false;
-    int num_worker_threads_ = kNumWorkerThreads;
-    bool perform_verification_ = true;
     bool resume_merge_ = false;
     bool merge_complete_ = false;
     HandlerOptions handler_options_;

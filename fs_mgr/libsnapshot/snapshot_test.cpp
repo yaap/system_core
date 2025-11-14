@@ -80,7 +80,6 @@ using android::fs_mgr::BlockDeviceInfo;
 using android::fs_mgr::CreateLogicalPartitionParams;
 using android::fs_mgr::DestroyLogicalPartition;
 using android::fs_mgr::EnsurePathMounted;
-using android::fs_mgr::EnsurePathUnmounted;
 using android::fs_mgr::Extent;
 using android::fs_mgr::Fstab;
 using android::fs_mgr::GetPartitionGroupName;
@@ -154,8 +153,8 @@ class SnapshotTest : public ::testing::Test {
             properties["ro.virtual_ab.io_uring.enabled"] = "false";
         }
 
-        auto fetcher = std::make_unique<SnapshotTestPropertyFetcher>("_a", std::move(properties));
-        IPropertyFetcher::OverrideForTesting(std::move(fetcher));
+        fetcher_ = std::make_shared<SnapshotTestPropertyFetcher>("_a", std::move(properties));
+        IPropertyFetcher::OverrideForTesting(fetcher_);
 
         if (GetLegacyCompressionEnabledProperty() || CanUseUserspaceSnapshots()) {
             // If we're asked to test the device's actual configuration, then it
@@ -534,6 +533,7 @@ class SnapshotTest : public ::testing::Test {
     std::string fake_super_;
     bool snapuserd_required_ = false;
     std::string test_name_;
+    std::shared_ptr<SnapshotTestPropertyFetcher> fetcher_;
 };
 
 TEST_F(SnapshotTest, CreateSnapshot) {
@@ -2133,23 +2133,6 @@ TEST_F(MetadataMountedTest, Android) {
     EXPECT_TRUE(sm->CancelUpdate()) << "Metadata dir should never be unmounted in Android mode";
 }
 
-TEST_F(MetadataMountedTest, Recovery) {
-    GTEST_SKIP() << "b/350715463";
-
-    test_device->set_recovery(true);
-    metadata_dir_ = test_device->GetMetadataDir();
-
-    EXPECT_TRUE(android::fs_mgr::EnsurePathUnmounted(&fstab_, metadata_dir_));
-    EXPECT_FALSE(IsMetadataMounted());
-
-    auto device = sm->EnsureMetadataMounted();
-    EXPECT_NE(nullptr, device);
-    EXPECT_TRUE(IsMetadataMounted());
-
-    device.reset();
-    EXPECT_FALSE(IsMetadataMounted());
-}
-
 // Test that during a merge, we can wipe data in recovery.
 TEST_F(SnapshotUpdateTest, MergeInRecovery) {
     // Execute the first update.
@@ -2827,6 +2810,40 @@ TEST_F(SnapshotUpdateTest, BadCowVersion) {
 
     dynamic_partition_metadata->set_cow_version(kMaxCowVersion);
     ASSERT_TRUE(sm->CreateUpdateSnapshots(manifest_));
+}
+
+TEST_F(SnapshotUpdateTest, MergeSwitchoverInterrupted) {
+    if (!snapuserd_required_) {
+        GTEST_SKIP() << "VABC only";
+    }
+
+    auto old_sys_size = GetSize(sys_);
+    auto old_prd_size = GetSize(prd_);
+
+    // Grow |sys| but shrink |prd|.
+    SetSize(sys_, old_sys_size * 2);
+    sys_->set_estimate_cow_size(8_MiB);
+    SetSize(prd_, old_prd_size / 2);
+    prd_->set_estimate_cow_size(1_MiB);
+
+    AddOperationForPartitions();
+
+    ASSERT_TRUE(sm->BeginUpdate());
+    ASSERT_TRUE(sm->CreateUpdateSnapshots(manifest_));
+    ASSERT_TRUE(WriteSnapshots());
+    ASSERT_TRUE(sm->FinishedSnapshotWrites(false));
+    ASSERT_TRUE(UnmapAll());
+
+    fetcher_->SetProperty("persist.virtual_ab.testing.block_merge_switchover", "true");
+
+    auto init = NewManagerForFirstStageMount("_b");
+    ASSERT_NE(init, nullptr);
+    ASSERT_TRUE(init->NeedSnapshotsInFirstStageMount());
+    ASSERT_TRUE(init->CreateLogicalAndSnapshotPartitions("super", snapshot_timeout_));
+    ASSERT_TRUE(init->InitiateMerge());
+
+    fetcher_->SetProperty("persist.virtual_ab.testing.block_merge_switchover", "false");
+    ASSERT_EQ(init->ProcessUpdateState(), UpdateState::MergeCompleted);
 }
 
 TEST_F(SnapshotTest, FlagCheck) {

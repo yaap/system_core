@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "init"
+
 #include "reboot.h"
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/ext4.h>
 #include <linux/f2fs.h>
 #include <linux/fs.h>
 #include <linux/loop.h>
@@ -49,6 +52,7 @@
 #include <android-base/unique_fd.h>
 #include <bootloader_message/bootloader_message.h>
 #include <cutils/android_reboot.h>
+#include <cutils/klog.h>
 #include <fs_mgr.h>
 #include <libsnapshot/snapshot.h>
 #include <logwrap/logwrap.h>
@@ -111,8 +115,7 @@ enum UmountStat {
     UMOUNT_STAT_TIMEOUT = 2,
     /* could not run due to error */
     UMOUNT_STAT_ERROR = 3,
-    /* not used by init but reserved for other part to use this to represent the
-       the state where umount status before reboot is not found / available. */
+    /* umount status before reboot is not found / available. */
     UMOUNT_STAT_NOT_AVAILABLE = 4,
 };
 
@@ -204,30 +207,35 @@ static Result<void> CallVdc(const std::string& system, const std::string& cmd) {
     return Error() << "'/system/bin/vdc " << system << " " << cmd << "' failed : " << status;
 }
 
-static void LogShutdownTime(UmountStat stat, Timer* t) {
-    LOG(WARNING) << "powerctl_shutdown_time_ms:" << std::to_string(t->duration().count()) << ":"
-                 << stat;
+// This function should be called just before kernel reboot/shutdown. At this point, the logd
+// is killed, regular logger does not work. Use KLOG to make sure the log is available in
+// pstore console file, preventing log data from losing.
+static void LogShutdownTime(UmountStat stat, const Timer& t) {
+    KLOG_WARNING(LOG_TAG, "powerctl_shutdown_time_ms:%lld:%d\n", t.duration().count(), stat);
 }
 
-static bool IsDataMounted(const std::string& fstype) {
+// Gets the filesystem type of the /data partition.
+// Returns the filesystem type as a string (e.g., "ext4", "f2fs") or an empty string if not found
+// or if an error occurs.
+static std::string GetDataFsType() {
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> fp(setmntent("/proc/mounts", "re"), endmntent);
     if (fp == nullptr) {
         PLOG(ERROR) << "Failed to open /proc/mounts";
-        return false;
+        return "";
     }
     mntent* mentry;
     while ((mentry = getmntent(fp.get())) != nullptr) {
         if (mentry->mnt_dir == "/data"s) {
-            return fstype == "*" || mentry->mnt_type == fstype;
+            return mentry->mnt_type;
         }
     }
-    return false;
+    return "";
 }
 
 // Find all read+write block devices and emulated devices in /proc/mounts and add them to
 // the correpsponding list.
 static bool FindPartitionsToUmount(std::vector<MountEntry>* block_dev_partitions,
-                                   std::vector<MountEntry>* emulated_partitions, bool dump) {
+                                   std::vector<MountEntry>* emulated_partitions) {
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> fp(setmntent("/proc/mounts", "re"), endmntent);
     if (fp == nullptr) {
         PLOG(ERROR) << "Failed to open /proc/mounts";
@@ -235,10 +243,7 @@ static bool FindPartitionsToUmount(std::vector<MountEntry>* block_dev_partitions
     }
     mntent* mentry;
     while ((mentry = getmntent(fp.get())) != nullptr) {
-        if (dump) {
-            LOG(INFO) << "mount entry " << mentry->mnt_fsname << ":" << mentry->mnt_dir << " opts "
-                      << mentry->mnt_opts << " type " << mentry->mnt_type;
-        } else if (MountEntry::IsBlockDevice(*mentry) && hasmntopt(mentry, "rw")) {
+        if (MountEntry::IsBlockDevice(*mentry) && hasmntopt(mentry, "rw")) {
             std::string mount_dir(mentry->mnt_dir);
             // These are R/O partitions changed to R/W after adb remount.
             // Do not umount them as shutdown critical services may rely on them.
@@ -253,6 +258,20 @@ static bool FindPartitionsToUmount(std::vector<MountEntry>* block_dev_partitions
     return true;
 }
 
+static void DumpPartitions() {
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> fp(setmntent("/proc/mounts", "re"), endmntent);
+    if (fp == nullptr) {
+        PLOG(ERROR) << "Failed to open /proc/mounts";
+        return;
+    }
+
+    mntent* mentry;
+    while ((mentry = getmntent(fp.get())) != nullptr) {
+        LOG(INFO) << "mount entry " << mentry->mnt_fsname << ":" << mentry->mnt_dir << " opts "
+                  << mentry->mnt_opts << " type " << mentry->mnt_type;
+    }
+}
+
 static void DumpUmountDebuggingInfo() {
     int status;
     if (!security_getenforce()) {
@@ -261,10 +280,70 @@ static void DumpUmountDebuggingInfo() {
         logwrap_fork_execvp(arraysize(lsof_argv), lsof_argv, &status, false, LOG_KLOG, true,
                             nullptr);
     }
-    FindPartitionsToUmount(nullptr, nullptr, true);
+    DumpPartitions();
     // dump current CPU stack traces and uninterruptible tasks
     WriteStringToFile("l", PROC_SYSRQ);
     WriteStringToFile("w", PROC_SYSRQ);
+}
+
+/** Attempts to unmount partitions
+ *
+ * @param force If true, forces the unmount operation, even if the filesystem is busy.
+ * @return UMOUNT_STAT_SUCCESS: if all partitions were unmounted successfully, or if no partitions
+ *         were found to unmount after umounting.
+ *         UMOUNT_STAT_NOT_AVAILABLE: failed to read umount stats from /proc/mounts.
+ *         UMOUNT_STAT_ERROR: failed to umount all partitions.
+ */
+static UmountStat TryUmountPartitions(bool force) {
+    std::vector<MountEntry> block_devices;
+    std::vector<MountEntry> emulated_devices;
+
+    // Find partitions to umount and store the mount entries in block_devices and emulated_devices
+    if (!FindPartitionsToUmount(&block_devices, &emulated_devices)) {
+        return UMOUNT_STAT_NOT_AVAILABLE;
+    }
+
+    // Success if there are no partitions need to umount
+    if (block_devices.empty()) {
+        return UMOUNT_STAT_SUCCESS;
+    }
+
+    bool unmount_success = true;
+    // Umount emulated device since /data partition needs all pending writes to be completed and
+    // all emulated partitions unmounted.
+    if (emulated_devices.size() > 0) {
+        for (auto& entry : emulated_devices) {
+            if (!entry.Umount(false)) unmount_success = false;
+        }
+        if (unmount_success) {
+            sync();
+        }
+    }
+
+    for (auto& entry : block_devices) {
+        if (!entry.Umount(force)) unmount_success = false;
+    }
+
+    if (unmount_success) {
+        return UMOUNT_STAT_SUCCESS;
+    }
+
+    // Some identical mount points may be umounted twice during unmounting, which can cause an
+    // INVALID_ARGUMENT error at second umount. However, they were actually unmounted
+    // successfully. Update the list of partitions that need to be umounted after the first
+    // attempt. If there are no partitions left to umount, we should consider the umount
+    // successful.
+    block_devices.clear();
+    emulated_devices.clear();
+    if (!FindPartitionsToUmount(&block_devices, &emulated_devices)) {
+        return UMOUNT_STAT_NOT_AVAILABLE;
+    }
+
+    if (block_devices.empty() && emulated_devices.empty()) {
+        return UMOUNT_STAT_SUCCESS;
+    }
+
+    return UMOUNT_STAT_ERROR;
 }
 
 static UmountStat UmountPartitions(std::chrono::milliseconds timeout) {
@@ -282,34 +361,20 @@ static UmountStat UmountPartitions(std::chrono::milliseconds timeout) {
     ReapAnyOutstandingChildren();
 
     Timer t;
-    /* data partition needs all pending writes to be completed and all emulated partitions
-     * umounted.If the current waiting is not good enough, give
-     * up and leave it to e2fsck after reboot to fix it.
+    /* If the current waiting is not good enough, give up and leave it to e2fsck after reboot to
+     * fix it.
      */
     while (true) {
-        std::vector<MountEntry> block_devices;
-        std::vector<MountEntry> emulated_devices;
-        if (!FindPartitionsToUmount(&block_devices, &emulated_devices, false)) {
+        // force umount operation if timeout is not set
+        UmountStat stat = TryUmountPartitions(/*force=*/timeout == 0ms);
+        if (stat == UMOUNT_STAT_SUCCESS) {
+            return UMOUNT_STAT_SUCCESS;
+        }
+
+        if (stat == UMOUNT_STAT_NOT_AVAILABLE || timeout == 0ms) {
             return UMOUNT_STAT_ERROR;
         }
-        if (block_devices.size() == 0) {
-            return UMOUNT_STAT_SUCCESS;
-        }
-        bool unmount_done = true;
-        if (emulated_devices.size() > 0) {
-            for (auto& entry : emulated_devices) {
-                if (!entry.Umount(false)) unmount_done = false;
-            }
-            if (unmount_done) {
-                sync();
-            }
-        }
-        for (auto& entry : block_devices) {
-            if (!entry.Umount(timeout == 0ms)) unmount_done = false;
-        }
-        if (unmount_done) {
-            return UMOUNT_STAT_SUCCESS;
-        }
+
         if ((timeout < t.duration())) {  // try umount at least once
             return UMOUNT_STAT_TIMEOUT;
         }
@@ -321,90 +386,91 @@ static void KillAllProcesses() {
     WriteStringToFile("i", PROC_SYSRQ);
 }
 
-// Create reboot/shutdwon monitor thread
-void RebootMonitorThread(unsigned int cmd, const std::string& reboot_target,
-                         sem_t* reboot_semaphore, std::chrono::milliseconds shutdown_timeout,
-                         bool* reboot_monitor_run) {
-    unsigned int remaining_shutdown_time = 0;
-
-    // 300 seconds more than the timeout passed to the thread as there is a final Umount pass
-    // after the timeout is reached.
+// Reboot/shutdown monitor thread
+static void RebootMonitorThread(unsigned int cmd, const Timer& shutdown_timer) {
+    // We want quite a long timeout here since the "sync" in the calling
+    // thread can be quite slow.
     constexpr unsigned int shutdown_watchdog_timeout_default = 300;
+    constexpr unsigned int shutdown_watchdog_timeout_min = 60;
     auto shutdown_watchdog_timeout = android::base::GetUintProperty(
             "ro.build.shutdown.watchdog.timeout", shutdown_watchdog_timeout_default);
-    remaining_shutdown_time = shutdown_watchdog_timeout + shutdown_timeout.count() / 1000;
 
-    while (*reboot_monitor_run == true) {
-        if (TEMP_FAILURE_RETRY(sem_wait(reboot_semaphore)) == -1) {
-            LOG(ERROR) << "sem_wait failed and exit RebootMonitorThread()";
-            return;
-        }
+    if (shutdown_watchdog_timeout < shutdown_watchdog_timeout_min) {
+        LOG(WARNING) << "ro.build.shutdown.watchdog.timeout = " << shutdown_watchdog_timeout
+                     << " is too small; bumping up to " << shutdown_watchdog_timeout_min;
+        shutdown_watchdog_timeout = shutdown_watchdog_timeout_min;
+    }
 
-        timespec shutdown_timeout_timespec;
-        if (clock_gettime(CLOCK_MONOTONIC, &shutdown_timeout_timespec) == -1) {
-            LOG(ERROR) << "clock_gettime() fail! exit RebootMonitorThread()";
-            return;
-        }
+    LOG(INFO) << "RebootMonitorThread started for " << shutdown_watchdog_timeout << "s";
+    std::chrono::duration timeout = std::chrono::seconds(shutdown_watchdog_timeout);
 
-        // If there are some remaining shutdown time left from previous round, we use
-        // remaining time here.
-        shutdown_timeout_timespec.tv_sec += remaining_shutdown_time;
+    constexpr unsigned int num_steps = 10;
+    std::chrono::duration sleep_amount =
+            std::chrono::duration_cast<std::chrono::milliseconds>(timeout) / num_steps;
 
-        LOG(INFO) << "shutdown_timeout_timespec.tv_sec: " << shutdown_timeout_timespec.tv_sec;
+    for (unsigned int i = 0; i < num_steps - 1; i++) {
+        std::this_thread::sleep_for(sleep_amount);
 
-        int sem_return = 0;
-        while ((sem_return = sem_timedwait_monotonic_np(reboot_semaphore,
-                                                        &shutdown_timeout_timespec)) == -1 &&
-               errno == EINTR) {
-        }
-
-        if (sem_return == -1) {
-            LOG(ERROR) << "Reboot thread timed out";
-
-            if (android::base::GetBoolProperty("ro.debuggable", false) == true) {
-                if (false) {
-                    // SEPolicy will block debuggerd from running and this is intentional.
-                    // But these lines are left to be enabled during debugging.
-                    LOG(INFO) << "Try to dump init process call trace:";
-                    const char* vdc_argv[] = {"/system/bin/debuggerd", "-b", "1"};
-                    int status;
-                    logwrap_fork_execvp(arraysize(vdc_argv), vdc_argv, &status, false, LOG_KLOG,
-                                        true, nullptr);
-                }
-                LOG(INFO) << "Show stack for all active CPU:";
-                WriteStringToFile("l", PROC_SYSRQ);
-
-                LOG(INFO) << "Show tasks that are in disk sleep(uninterruptable sleep), which are "
-                             "like "
-                             "blocked in mutex or hardware register access:";
-                WriteStringToFile("w", PROC_SYSRQ);
-            }
-
-            // In shutdown case,notify kernel to sync and umount fs to read-only before shutdown.
-            if (cmd == ANDROID_RB_POWEROFF || cmd == ANDROID_RB_THERMOFF) {
-                WriteStringToFile("s", PROC_SYSRQ);
-
-                WriteStringToFile("u", PROC_SYSRQ);
-
-                RebootSystem(cmd, reboot_target);
-            }
-
-            LOG(ERROR) << "Trigger crash at last!";
-            WriteStringToFile("c", PROC_SYSRQ);
+        // Print a message periodically as we're waiting so there is some
+        // warning in the logs if we're getting close to triggering. Use this
+        // as a chance to try to preserve data by using the "sync" and
+        // "force remount readonly" sysrq requests, both of which kick off
+        // background work and are non-blocking. We'll do "sync" most of the
+        // time and only do the more intrusive remount right before the last
+        // delay (to give it time to take effect).
+        LOG(WARNING) << "Reboot monitor still running, forced reboot in "
+                     << ((num_steps - i - 1) * sleep_amount.count()) << " ms";
+        if (i == num_steps - 2) {
+            WriteStringToFile("u", PROC_SYSRQ);
         } else {
-            timespec current_time_timespec;
-
-            if (clock_gettime(CLOCK_MONOTONIC, &current_time_timespec) == -1) {
-                LOG(ERROR) << "clock_gettime() fail! exit RebootMonitorThread()";
-                return;
-            }
-
-            remaining_shutdown_time =
-                    shutdown_timeout_timespec.tv_sec - current_time_timespec.tv_sec;
-
-            LOG(INFO) << "remaining_shutdown_time: " << remaining_shutdown_time;
+            WriteStringToFile("s", PROC_SYSRQ);
         }
     }
+    std::this_thread::sleep_for(sleep_amount);
+
+    LOG(ERROR) << "Reboot thread timed out";
+
+    if (android::base::GetBoolProperty("ro.debuggable", false) == true) {
+        if (false) {
+            // SEPolicy will block debuggerd from running and this is intentional.
+            // But these lines are left to be enabled during debugging.
+            LOG(INFO) << "Try to dump init process call trace:";
+            const char* vdc_argv[] = {"/system/bin/debuggerd", "-b", "1"};
+            int status;
+            logwrap_fork_execvp(arraysize(vdc_argv), vdc_argv, &status, false, LOG_KLOG, true,
+                                nullptr);
+        }
+        LOG(INFO) << "Show stack for all active CPU:";
+        WriteStringToFile("l", PROC_SYSRQ);
+
+        LOG(INFO) << "Show tasks that are in disk sleep(uninterruptable sleep), which are "
+                     "like "
+                     "blocked in mutex or hardware register access:";
+        WriteStringToFile("w", PROC_SYSRQ);
+    }
+
+    if (cmd == ANDROID_RB_POWEROFF || cmd == ANDROID_RB_THERMOFF) {
+        LogShutdownTime(UMOUNT_STAT_TIMEOUT, shutdown_timer);
+        RebootSystem(cmd, "");
+    }
+
+    LOG(ERROR) << "Trigger crash at last!";
+    WriteStringToFile("c", PROC_SYSRQ);
+}
+
+// Create reboot/shutdown monitor thread
+static void StartRebootMonitorThread(unsigned int cmd, const Timer& shutdown_timer) {
+    static std::atomic_flag started{};
+
+    // Only allow the monitor to be started once.
+    if (started.test_and_set(std::memory_order_acquire)) {
+        LOG(INFO) << "RebootMonitorThread already started";
+        return;
+    }
+
+    LOG(INFO) << "Starting RebootMonitorThread";
+    std::thread reboot_monitor_thread(&RebootMonitorThread, cmd, shutdown_timer);
+    reboot_monitor_thread.detach();
 }
 
 static bool UmountDynamicPartitions(const std::vector<std::string>& dynamic_partitions) {
@@ -435,27 +501,30 @@ static bool UmountDynamicPartitions(const std::vector<std::string>& dynamic_part
  * return true when umount was successful. false when timed out.
  */
 static UmountStat TryUmountAndFsck(unsigned int cmd, bool run_fsck,
-                                   std::chrono::milliseconds timeout, sem_t* reboot_semaphore) {
+                                   std::chrono::milliseconds timeout) {
     Timer t;
     std::vector<MountEntry> block_devices;
     std::vector<MountEntry> emulated_devices;
     std::vector<std::string> dynamic_partitions;
 
-    if (run_fsck && !FindPartitionsToUmount(&block_devices, &emulated_devices, false)) {
+    if (run_fsck && !FindPartitionsToUmount(&block_devices, &emulated_devices)) {
         return UMOUNT_STAT_ERROR;
     }
-    auto sm = snapshot::SnapshotManager::New();
     bool ota_update_in_progress = false;
-    if (sm->IsUserspaceSnapshotUpdateInProgress(dynamic_partitions)) {
-        LOG(INFO) << "OTA update in progress. Pause snapshot merge";
-        if (!sm->PauseSnapshotMerge()) {
-            LOG(ERROR) << "Snapshot-merge pause failed";
+    if (!IsMicrodroid()) {
+        auto sm = snapshot::SnapshotManager::New();
+        if (sm->IsUserspaceSnapshotUpdateInProgress(dynamic_partitions)) {
+            LOG(INFO) << "OTA update in progress. Pause snapshot merge";
+            if (!sm->PauseSnapshotMerge()) {
+                LOG(ERROR) << "Snapshot-merge pause failed";
+            }
+            ota_update_in_progress = true;
         }
-        ota_update_in_progress = true;
     }
     UmountStat stat = UmountPartitions(timeout - t.duration());
     if (stat != UMOUNT_STAT_SUCCESS) {
-        LOG(INFO) << "umount timeout, last resort, kill all and try";
+        // Do not delete: Critical log for reboot_fs_integrity_test.
+        KLOG_INFO(LOG_TAG, "umount timeout, last resort, kill all and try");
         if (DUMP_ON_UMOUNT_FAILURE) DumpUmountDebuggingInfo();
         // Since umount timedout, we will try to kill all processes
         // and do one more attempt to umount the partitions.
@@ -490,17 +559,9 @@ static UmountStat TryUmountAndFsck(unsigned int cmd, bool run_fsck,
     }
 
     if (stat == UMOUNT_STAT_SUCCESS && run_fsck) {
-        LOG(INFO) << "Pause reboot monitor thread before fsck";
-        sem_post(reboot_semaphore);
-
-        // fsck part is excluded from timeout check. It only runs for user initiated shutdown
-        // and should not affect reboot time.
         for (auto& entry : block_devices) {
             entry.DoFsck();
         }
-
-        LOG(INFO) << "Resume reboot monitor thread after fsck";
-        sem_post(reboot_semaphore);
     }
     return stat;
 }
@@ -532,7 +593,7 @@ static Result<void> KillZramBackingDevice() {
         return ErrnoError() << "Failed to read " << ZRAM_BACK_DEV;
     }
 
-    android::base::Trim(backing_dev);
+    backing_dev = android::base::Trim(backing_dev);
 
     if (android::base::StartsWith(backing_dev, "none")) {
         LOG(INFO) << "No zram backing device configured";
@@ -557,7 +618,7 @@ static Result<void> KillZramBackingDevice() {
         return ErrnoError() << "Failed to read " << ZRAM_BACK_DEV;
     }
 
-    android::base::Trim(backing_dev);
+    backing_dev = android::base::Trim(backing_dev);
 
     if (!android::base::StartsWith(backing_dev, "/dev/block/loop")) {
         LOG(INFO) << backing_dev << " is not a loop device. Exiting early";
@@ -657,35 +718,25 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
 
     bool is_thermal_shutdown = cmd == ANDROID_RB_THERMOFF;
 
-    auto shutdown_timeout = 0ms;
+    auto clean_shutdown_timeout = 0ms;
     if (!SHUTDOWN_ZERO_TIMEOUT) {
-        constexpr unsigned int shutdown_timeout_default = 6;
-        constexpr unsigned int max_thermal_shutdown_timeout = 3;
-        auto shutdown_timeout_final = android::base::GetUintProperty("ro.build.shutdown_timeout",
-                                                                     shutdown_timeout_default);
-        if (is_thermal_shutdown && shutdown_timeout_final > max_thermal_shutdown_timeout) {
-            shutdown_timeout_final = max_thermal_shutdown_timeout;
+        constexpr unsigned int clean_shutdown_timeout_default = 6;
+        constexpr unsigned int max_clean_thermal_shutdown_timeout = 3;
+        constexpr unsigned int max_clean_shutdown_timeout = 10;
+        auto shutdown_timeout_final = android::base::GetUintProperty(
+                "ro.build.shutdown_timeout", clean_shutdown_timeout_default);
+        if (is_thermal_shutdown && shutdown_timeout_final > max_clean_thermal_shutdown_timeout) {
+            shutdown_timeout_final = max_clean_thermal_shutdown_timeout;
+        } else if (shutdown_timeout_final > max_clean_shutdown_timeout) {
+            LOG(WARNING) << "Shorten clean shutdown timeout from " << shutdown_timeout_final
+                         << " s to " << max_clean_shutdown_timeout << " s";
+            shutdown_timeout_final = max_clean_shutdown_timeout;
         }
-        shutdown_timeout = std::chrono::seconds(shutdown_timeout_final);
+        clean_shutdown_timeout = std::chrono::seconds(shutdown_timeout_final);
     }
-    LOG(INFO) << "Shutdown timeout: " << shutdown_timeout.count() << " ms";
+    LOG(INFO) << "Clean shutdown timeout: " << clean_shutdown_timeout.count() << " ms";
 
-    sem_t reboot_semaphore;
-    if (sem_init(&reboot_semaphore, false, 0) == -1) {
-        // These should never fail, but if they do, skip the graceful reboot and reboot immediately.
-        LOG(ERROR) << "sem_init() fail and RebootSystem() return!";
-        RebootSystem(cmd, reboot_target, reason);
-    }
-
-    // Start a thread to monitor init shutdown process
-    LOG(INFO) << "Create reboot monitor thread.";
-    bool reboot_monitor_run = true;
-    std::thread reboot_monitor_thread(&RebootMonitorThread, cmd, reboot_target, &reboot_semaphore,
-                                      shutdown_timeout, &reboot_monitor_run);
-    reboot_monitor_thread.detach();
-
-    // Start reboot monitor thread
-    sem_post(&reboot_semaphore);
+    StartRebootMonitorThread(cmd, t);
 
     // Ensure last reboot reason is reduced to canonical
     // alias reported in bootloader or system boot reason.
@@ -700,8 +751,9 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
 
     // If /data isn't mounted then we can skip the extra reboot steps below, since we don't need to
     // worry about unmounting it.
-    if (!IsDataMounted("*")) {
+    if (GetDataFsType().empty()) {
         sync();
+        LogShutdownTime(UMOUNT_STAT_SKIPPED, t);
         RebootSystem(cmd, reboot_target, reason);
         abort();
     }
@@ -771,8 +823,8 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
 
     // optional shutdown step
     // 1. terminate all services except shutdown critical ones. wait for delay to finish
-    if (shutdown_timeout > 0ms) {
-        StopServicesAndLogViolations(stop_first, shutdown_timeout / 2, true /* SIGTERM */);
+    if (clean_shutdown_timeout > 0ms) {
+        StopServicesAndLogViolations(stop_first, clean_shutdown_timeout / 2, true /* SIGTERM */);
     }
     // Send SIGKILL to ones that didn't terminate cleanly.
     StopServicesAndLogViolations(stop_first, 0ms, false /* SIGKILL */);
@@ -808,8 +860,7 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
     if (auto ret = UnmountAllApexes(); !ret.ok()) {
         LOG(ERROR) << ret.error();
     }
-    UmountStat stat =
-            TryUmountAndFsck(cmd, run_fsck, shutdown_timeout - t.duration(), &reboot_semaphore);
+    UmountStat stat = TryUmountAndFsck(cmd, run_fsck, clean_shutdown_timeout - t.duration());
     // Follow what linux shutdown is doing: one more sync with little bit delay
     {
         Timer sync_timer;
@@ -818,24 +869,38 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
         LOG(INFO) << "sync() after umount took" << sync_timer;
     }
     if (!is_thermal_shutdown) std::this_thread::sleep_for(100ms);
-    LogShutdownTime(stat, &t);
-
-    // Send signal to terminate reboot monitor thread.
-    reboot_monitor_run = false;
-    sem_post(&reboot_semaphore);
 
     // Reboot regardless of umount status. If umount fails, fsck after reboot will fix it.
-    if (IsDataMounted("f2fs")) {
-        uint32_t flag = F2FS_GOING_DOWN_FULLSYNC;
-        unique_fd fd(TEMP_FAILURE_RETRY(open("/data", O_RDONLY)));
-        LOG(INFO) << "Invoking F2FS_IOC_SHUTDOWN during shutdown";
-        int ret = ioctl(fd.get(), F2FS_IOC_SHUTDOWN, &flag);
-        if (ret) {
-            PLOG(ERROR) << "Shutdown /data: ";
+    std::string data_fs_type = GetDataFsType();
+    if (!data_fs_type.empty()) {
+        // Do not delete: Critical log for reboot_fs_integrity_test.
+        KLOG_WARNING(LOG_TAG, "Umount /data failed, try to use ioctl to shutdown");
+        if (data_fs_type == "f2fs") {
+            uint32_t flag = F2FS_GOING_DOWN_FULLSYNC;
+            unique_fd fd(TEMP_FAILURE_RETRY(open("/data", O_RDONLY)));
+            LOG(INFO) << "Invoking F2FS_IOC_SHUTDOWN during shutdown";
+            int ret = ioctl(fd.get(), F2FS_IOC_SHUTDOWN, &flag);
+            if (ret) {
+                PLOG(ERROR) << "Shutdown /data: ";
+            } else {
+                LOG(INFO) << "Shutdown /data";
+            }
+        } else if (data_fs_type == "ext4") {
+            uint32_t flag = EXT4_GOING_FLAGS_DEFAULT;
+            unique_fd fd(TEMP_FAILURE_RETRY(open("/data", O_RDONLY)));
+            LOG(INFO) << "Invoking EXT4_IOC_SHUTDOWN during shutdown";
+            int ret = ioctl(fd.get(), EXT4_IOC_SHUTDOWN, &flag);
+            if (ret) {
+                PLOG(ERROR) << "Shutdown /data: ";
+            } else {
+                LOG(INFO) << "Shutdown /data";
+            }
         } else {
-            LOG(INFO) << "Shutdown /data";
+            LOG(ERROR) << "Unknown /data fs type: " << data_fs_type;
         }
     }
+
+    LogShutdownTime(stat, t);
     RebootSystem(cmd, reboot_target, reason);
     abort();
 }
@@ -873,6 +938,21 @@ static bool CommandIsPresent(bootloader_message* boot) {
 
     memset(boot->command, 0, sizeof(boot->command));
     return false;
+}
+
+void HandleShutdownRequestedMessage(const std::string& command) {
+    int cmd;
+    Timer t;
+
+    if (command.starts_with("0thermal")) {
+        cmd = ANDROID_RB_THERMOFF;
+    } else if (command.starts_with("0")) {
+        cmd = ANDROID_RB_POWEROFF;
+    } else {
+        cmd = ANDROID_RB_RESTART2;
+    }
+
+    StartRebootMonitorThread(cmd, t);
 }
 
 void HandlePowerctlMessage(const std::string& command) {

@@ -35,6 +35,7 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android/avf_cc_flags.h>
+#include <com_android_apex_flags.h>
 #include <fs_avb/fs_avb.h>
 #include <fs_mgr.h>
 #include <fs_mgr_dm_linear.h>
@@ -113,7 +114,6 @@ class FirstStageMountVBootV2 : public FirstStageMount {
 
     bool InitAvbHandle();
 
-    bool need_dm_verity_;
     bool dsu_not_on_userdata_ = false;
     bool use_snapuserd_ = false;
 
@@ -309,6 +309,11 @@ bool FirstStageMountVBootV2::InitDevices() {
             return false;
         }
     }
+
+    if constexpr (com::android::apex::flags::mount_before_data()) {
+        block_dev_init_.InitLoopDevices();
+    }
+
     return true;
 }
 
@@ -369,7 +374,7 @@ bool FirstStageMountVBootV2::CreateLogicalPartitions() {
         return false;
     }
 
-    if (SnapshotManager::IsSnapshotManagerNeeded()) {
+    if (!IsMicrodroid() && SnapshotManager::IsSnapshotManagerNeeded()) {
         auto init_devices = [this](const std::string& device) -> bool {
             if (android::base::StartsWith(device, "/dev/block/dm-")) {
                 return block_dev_init_.InitDmDevice(device);
@@ -731,7 +736,7 @@ void FirstStageMountVBootV2::UseDsuIfPresent() {
 }
 
 FirstStageMountVBootV2::FirstStageMountVBootV2(Fstab fstab)
-    : need_dm_verity_(false), fstab_(std::move(fstab)), avb_handle_(nullptr) {
+    : fstab_(std::move(fstab)), avb_handle_(nullptr) {
     super_partition_name_ = fs_mgr_get_super_partition_name();
 
     std::string device_tree_vbmeta_parts;
@@ -755,14 +760,14 @@ FirstStageMountVBootV2::FirstStageMountVBootV2(Fstab fstab)
 }
 
 bool FirstStageMountVBootV2::GetDmVerityDevices(std::set<std::string>* devices) {
-    need_dm_verity_ = false;
+    bool need_dm_verity = false;
 
     std::set<std::string> logical_partitions;
 
     // fstab_rec->blk_device has A/B suffix.
     for (const auto& fstab_entry : fstab_) {
         if (fstab_entry.fs_mgr_flags.avb) {
-            need_dm_verity_ = true;
+            need_dm_verity = true;
         }
         // Skip pseudo filesystems.
         if (fstab_entry.fs_type == "overlay") {
@@ -778,7 +783,7 @@ bool FirstStageMountVBootV2::GetDmVerityDevices(std::set<std::string>* devices) 
 
     // Any partitions needed for verifying the partitions used in first stage mount, e.g. vbmeta
     // must be provided as vbmeta_partitions.
-    if (need_dm_verity_) {
+    if (need_dm_verity) {
         if (vbmeta_partitions_.empty()) {
             LOG(ERROR) << "Missing vbmeta partitions";
             return false;

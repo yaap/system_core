@@ -43,6 +43,7 @@
 #include <libdm/dm.h>
 #include <libfiemap/image_manager.h>
 #include <liblp/liblp.h>
+#include <liblp/property_fetcher.h>
 
 #include <android/snapshot/snapshot.pb.h>
 #include <libsnapshot/snapshot_stats.h>
@@ -72,6 +73,7 @@ using android::fs_mgr::CreateLogicalPartition;
 using android::fs_mgr::CreateLogicalPartitionParams;
 using android::fs_mgr::GetPartitionGroupName;
 using android::fs_mgr::GetPartitionName;
+using android::fs_mgr::IPropertyFetcher;
 using android::fs_mgr::LpMetadata;
 using android::fs_mgr::MetadataBuilder;
 using android::fs_mgr::SlotNumberForSlotSuffix;
@@ -763,7 +765,7 @@ bool SnapshotManager::MapSourceDevice(LockedFile* lock, const std::string& name,
     auto slot = SlotNumberForSlotSuffix(slot_suffix);
 
     CreateLogicalPartitionParams params = {
-            .block_device = device_->GetSuperDevice(slot),
+            .block_device = device_->GetSuperDevice(),
             .metadata = metadata,
             .partition_name = old_name,
             .timeout_ms = timeout_ms,
@@ -954,6 +956,11 @@ bool SnapshotManager::InitiateMerge() {
     // eligible snapshot must be a merge target.
     if (!WriteSnapshotUpdateStatus(lock.get(), initial_status)) {
         return false;
+    }
+
+    if (GetDebugFlag("block_merge_switchover")) {
+        LOG(INFO) << "Merge switchover blocked for testing.";
+        return true;
     }
 
     auto reported_code = MergeFailureCode::Ok;
@@ -1372,38 +1379,51 @@ auto SnapshotManager::CheckTargetMergeState(LockedFile* lock, const std::string&
             return MergeResult(UpdateState::MergeFailed, MergeFailureCode::UnknownTargetType);
         }
 
-        // This is the case when device reboots during merge. Once the device boots,
-        // snapuserd daemon will not resume merge immediately in first stage init.
-        // This is slightly different as compared to dm-snapshot-merge; In this
-        // case, metadata file will have "MERGING" state whereas the daemon will be
-        // waiting to resume the merge. Thus, we resume the merge at this point.
-        if (merge_status == "snapshot" && snapshot_status.state() == SnapshotState::MERGING) {
-            if (!snapuserd_client_->InitiateMerge(name)) {
-                return MergeResult(UpdateState::MergeFailed, MergeFailureCode::UnknownTargetType);
-            }
-            return MergeResult(UpdateState::Merging);
-        }
-
-        if (merge_status == "snapshot" &&
-            DecideMergePhase(snapshot_status) == MergePhase::SECOND_PHASE) {
-            if (update_status.merge_phase() == MergePhase::FIRST_PHASE) {
-                // The snapshot is not being merged because it's in the wrong phase.
-                return MergeResult(UpdateState::None);
-            } else {
-                // update_status is already in second phase but the
-                // snapshot_status is still not set to SnapshotState::MERGING.
-                //
-                // Resume the merge at this point. see b/374225913
-                LOG(INFO) << "SwitchSnapshotToMerge: " << name << " after resuming merge";
-                auto code = SwitchSnapshotToMerge(lock, name);
-                if (code != MergeFailureCode::Ok) {
-                    LOG(ERROR) << "Failed to switch snapshot: " << name
-                               << " to merge during second phase";
+        if (merge_status == "snapshot") {
+            // This is the case when device reboots during merge. Once the device boots,
+            // snapuserd daemon will not resume merge immediately in first stage init.
+            // This is slightly different as compared to dm-snapshot-merge; In this
+            // case, metadata file will have "MERGING" state whereas the daemon will be
+            // waiting to resume the merge. Thus, we resume the merge at this point.
+            if (snapshot_status.state() == SnapshotState::MERGING) {
+                if (!snapuserd_client_->InitiateMerge(name)) {
                     return MergeResult(UpdateState::MergeFailed,
                                        MergeFailureCode::UnknownTargetType);
                 }
                 return MergeResult(UpdateState::Merging);
             }
+
+            auto intended_phase = DecideMergePhase(snapshot_status);
+            if (intended_phase == MergePhase::SECOND_PHASE &&
+                update_status.merge_phase() == MergePhase::FIRST_PHASE) {
+                // The snapshot is not being merged because it's in the wrong phase.
+                return MergeResult(UpdateState::None);
+            }
+
+            // The inverse of the above condition should never be true. We
+            // should not enter the next phase without completing the first
+            // phase.
+            if (intended_phase != update_status.merge_phase()) {
+                LOG(ERROR) << "Snapshot " << name << " is out of phase";
+                return MergeResult(UpdateState::MergeFailed, MergeFailureCode::IncorrectMergePhase);
+            }
+
+            if (GetDebugFlag("block_merge_switchover")) {
+                LOG(INFO) << "Delayed merge switchover blocked for testing.";
+                return MergeResult(UpdateState::Merging);
+            }
+
+            // Resume the merge at this point. see b/374225913. We were probably
+            // interrupted during a phase change.
+            LOG(INFO) << "SwitchSnapshotToMerge: " << name << " after resuming merge";
+
+            auto code = SwitchSnapshotToMerge(lock, name);
+            if (code != MergeFailureCode::Ok) {
+                LOG(ERROR) << "Failed to switch snapshot: " << name
+                           << " to merge during second phase";
+                return MergeResult(UpdateState::MergeFailed, MergeFailureCode::UnknownTargetType);
+            }
+            return MergeResult(UpdateState::Merging);
         }
 
         if (merge_status == "snapshot-merge") {
@@ -1665,7 +1685,7 @@ bool SnapshotManager::CollapseSnapshotDevice(LockedFile* lock, const std::string
     uint32_t slot = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
     // Create a DmTable that is identical to the base device.
     CreateLogicalPartitionParams base_device_params{
-            .block_device = device_->GetSuperDevice(slot),
+            .block_device = device_->GetSuperDevice(),
             .metadata_slot = slot,
             .partition_name = name,
             .partition_opener = &device_->GetPartitionOpener(),
@@ -1930,7 +1950,7 @@ bool SnapshotManager::PerformInitTransition(InitTransition transition,
 std::unique_ptr<LpMetadata> SnapshotManager::ReadCurrentMetadata() {
     const auto& opener = device_->GetPartitionOpener();
     uint32_t slot = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
-    auto super_device = device_->GetSuperDevice(slot);
+    auto super_device = device_->GetSuperDevice();
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, slot);
     if (!metadata) {
         LOG(ERROR) << "Could not read dynamic partition metadata for device: " << super_device;
@@ -1999,7 +2019,7 @@ bool SnapshotManager::GetSnapshotFlashingStatus(LockedFile* lock,
     // metadata are in sync, so flashing all partitions on the source slot will
     // remove the UPDATED flag on the target slot as well.
     const auto& opener = device_->GetPartitionOpener();
-    auto super_device = device_->GetSuperDevice(target_slot);
+    auto super_device = device_->GetSuperDevice();
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, target_slot);
     if (!metadata) {
         return false;
@@ -2476,17 +2496,20 @@ bool SnapshotManager::NeedSnapshotsInFirstStageMount() {
         if (slot == Slot::Source) {
             // Device is rebooting into the original slot, so mark this as a
             // rollback.
+            auto contents = ReadUpdateSourceSlotSuffix();
             auto path = GetRollbackIndicatorPath();
             if (!android::base::WriteStringToFile("1", path)) {
                 PLOG(ERROR) << "Unable to write rollback indicator: " << path;
             } else {
-                LOG(INFO) << "Rollback detected, writing rollback indicator to " << path;
+                LOG(INFO) << "Rollback detected, writing rollback indicator to " << path
+                          << ". UpdateSourceSlot: " << contents;
                 if (device_->IsTempMetadata()) {
                     CleanupScratchOtaMetadataIfPresent();
                 }
             }
         }
-        LOG(INFO) << "Not booting from new slot. Will not mount snapshots.";
+        LOG(INFO) << "Not booting from new slot: " << device_->GetSlotSuffix()
+                  << ". Will not mount snapshots.";
         return false;
     }
 
@@ -3010,7 +3033,7 @@ bool SnapshotManager::MapAllSnapshots(const std::chrono::milliseconds& timeout_m
     const auto& opener = device_->GetPartitionOpener();
     auto slot_suffix = device_->GetOtherSlotSuffix();
     auto slot_number = SlotNumberForSlotSuffix(slot_suffix);
-    auto super_device = device_->GetSuperDevice(slot_number);
+    auto super_device = device_->GetSuperDevice();
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, slot_number);
     if (!metadata) {
         LOG(ERROR) << "MapAllSnapshots could not read dynamic partition metadata for device: "
@@ -3445,7 +3468,7 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
     uint32_t current_slot = SlotNumberForSlotSuffix(current_suffix);
     auto target_suffix = device_->GetOtherSlotSuffix();
     uint32_t target_slot = SlotNumberForSlotSuffix(target_suffix);
-    auto current_super = device_->GetSuperDevice(current_slot);
+    auto current_super = device_->GetSuperDevice();
 
     auto current_metadata = MetadataBuilder::New(opener, current_super, current_slot);
     if (current_metadata == nullptr) {
@@ -3477,14 +3500,6 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
     // Delete previous COW partitions in current_metadata so that PartitionCowCreator marks those as
     // free regions.
     UnmapAndDeleteCowPartition(current_metadata.get());
-
-    // Check that all these metadata is not retrofit dynamic partitions. Snapshots on
-    // devices with retrofit dynamic partitions does not make sense.
-    // This ensures that current_metadata->GetFreeRegions() uses the same device
-    // indices as target_metadata (i.e. 0 -> "super").
-    // This is also assumed in MapCowDevices() call below.
-    CHECK(current_metadata->GetBlockDevicePartitionName(0) == LP_METADATA_DEFAULT_PARTITION_NAME &&
-          target_metadata->GetBlockDevicePartitionName(0) == LP_METADATA_DEFAULT_PARTITION_NAME);
 
     const auto& dap_metadata = manifest.dynamic_partition_metadata();
 
@@ -3592,8 +3607,8 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
                                     all_snapshot_status);
     if (!ret.is_ok()) return ret;
 
-    if (!UpdatePartitionTable(opener, device_->GetSuperDevice(target_slot),
-                              *exported_target_metadata, target_slot)) {
+    if (!UpdatePartitionTable(opener, device_->GetSuperDevice(), *exported_target_metadata,
+                              target_slot)) {
         LOG(ERROR) << "Cannot write target metadata";
         return Return::Error();
     }
@@ -4042,7 +4057,7 @@ bool SnapshotManager::UnmapAllPartitionsInRecovery() {
 
     const auto& opener = device_->GetPartitionOpener();
     uint32_t slot = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
-    auto super_device = device_->GetSuperDevice(slot);
+    auto super_device = device_->GetSuperDevice();
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, slot);
     if (!metadata) {
         LOG(ERROR) << "Could not read dynamic partition metadata for device: " << super_device;
@@ -4233,7 +4248,7 @@ bool SnapshotManager::HandleImminentDataWipe(const std::function<void()>& callba
 
     if (try_merge) {
         auto slot_number = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
-        auto super_path = device_->GetSuperDevice(slot_number);
+        auto super_path = device_->GetSuperDevice();
         if (!CreateLogicalAndSnapshotPartitions(super_path, 20s)) {
             LOG(ERROR) << "Unable to map partitions to complete merge.";
             return false;
@@ -4281,7 +4296,7 @@ bool SnapshotManager::FinishMergeInRecovery() {
     }
 
     auto slot_number = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
-    auto super_path = device_->GetSuperDevice(slot_number);
+    auto super_path = device_->GetSuperDevice();
     if (!CreateLogicalAndSnapshotPartitions(super_path, 20s)) {
         LOG(ERROR) << "Unable to map partitions to complete merge.";
         return false;
@@ -4412,7 +4427,7 @@ CreateResult SnapshotManager::RecoveryCreateSnapshotDevices(
 
     auto slot_suffix = device_->GetOtherSlotSuffix();
     auto slot_number = SlotNumberForSlotSuffix(slot_suffix);
-    auto super_path = device_->GetSuperDevice(slot_number);
+    auto super_path = device_->GetSuperDevice();
     if (!CreateLogicalAndSnapshotPartitions(super_path, 20s)) {
         LOG(ERROR) << "Unable to map partitions.";
         return CreateResult::ERROR;

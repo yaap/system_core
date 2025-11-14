@@ -43,6 +43,7 @@ DEFINE_string(
 DEFINE_string(compression, "lz4",
               "Compression algorithm. Default is set to lz4. Available options: lz4, zstd, gz");
 DEFINE_bool(merkel_tree, false, "If true, source image hash is obtained from verity merkel tree");
+DEFINE_bool(inplace_copy_ops, false, "If true, inplace copy ops are added to the snapshot patch");
 
 namespace android {
 namespace snapshot {
@@ -58,7 +59,7 @@ class CreateSnapshot {
   public:
     CreateSnapshot(const std::string& src_file, const std::string& target_file,
                    const std::string& patch_file, const std::string& compression,
-                   const bool& merkel_tree);
+                   const bool& merkel_tree, const bool& inplace_copy_ops);
     bool CreateSnapshotPatch();
 
   private:
@@ -75,6 +76,7 @@ class CreateSnapshot {
      */
     std::string parsing_file_;
     bool create_snapshot_patch_ = false;
+    bool incremental_ = true;
 
     const int kNumThreads = 6;
     const size_t kBlockSizeToRead = 1_MiB;
@@ -103,6 +105,7 @@ class CreateSnapshot {
     bool ReadBlocks(off_t offset, const int skip_blocks, const uint64_t dev_sz);
     std::string ToHexString(const uint8_t* buf, size_t len);
 
+    bool CreateSnapshotFullOta();
     bool CreateSnapshotFile();
     bool FindSourceBlockHash();
     bool PrepareParse(std::string& parsing_file, const bool createSnapshot);
@@ -121,6 +124,7 @@ class CreateSnapshot {
     bool ParseSourceMerkelTree();
 
     bool use_merkel_tree_ = false;
+    bool allow_inplace_copy_ops_ = false;
     std::vector<uint8_t> target_salt_;
     std::vector<uint8_t> source_salt_;
 };
@@ -136,13 +140,18 @@ void CreateSnapshotLogger(android::base::LogId, android::base::LogSeverity sever
 
 CreateSnapshot::CreateSnapshot(const std::string& src_file, const std::string& target_file,
                                const std::string& patch_file, const std::string& compression,
-                               const bool& merkel_tree)
+                               const bool& merkel_tree, const bool& inplace_copy_ops)
     : src_file_(src_file),
       target_file_(target_file),
       patch_file_(patch_file),
-      use_merkel_tree_(merkel_tree) {
+      use_merkel_tree_(merkel_tree),
+      allow_inplace_copy_ops_(inplace_copy_ops) {
     if (!compression.empty()) {
         compression_ = compression;
+    }
+
+    if (src_file_.empty()) {
+        incremental_ = false;
     }
 }
 
@@ -259,10 +268,21 @@ bool CreateSnapshot::CreateSnapshotFile() {
     return ParsePartition();
 }
 
+bool CreateSnapshot::CreateSnapshotFullOta() {
+    if (!PrepareParse(target_file_, true)) {
+        return false;
+    }
+    return ParsePartition();
+}
+
 /*
  * Creates snapshot patch file by comparing source.img and target.img
  */
 bool CreateSnapshot::CreateSnapshotPatch() {
+    if (!incremental_) {
+        return CreateSnapshotFullOta();
+    }
+
     if (!FindSourceBlockHash()) {
         return false;
     }
@@ -289,22 +309,24 @@ std::string CreateSnapshot::ToHexString(const uint8_t* buf, size_t len) {
 
 void CreateSnapshot::PrepareMergeBlock(const void* buffer, uint64_t block,
                                        std::string& block_hash) {
-    if (std::memcmp(zblock_.get(), buffer, BLOCK_SZ) == 0) {
-        std::lock_guard<std::mutex> lock(write_lock_);
-        zero_blocks_.push_back(block);
-        return;
-    }
-
-    auto iter = source_block_hash_.find(block_hash);
-    if (iter != source_block_hash_.end()) {
-        std::lock_guard<std::mutex> lock(write_lock_);
-        // In-place copy is skipped
-        if (block != iter->second) {
-            copy_blocks_[block] = iter->second;
-        } else {
-            in_place_ops_ += 1;
+    if (incremental_) {
+        if (std::memcmp(zblock_.get(), buffer, BLOCK_SZ) == 0) {
+            std::lock_guard<std::mutex> lock(write_lock_);
+            zero_blocks_.push_back(block);
+            return;
         }
-        return;
+
+        auto iter = source_block_hash_.find(block_hash);
+        if (iter != source_block_hash_.end()) {
+            std::lock_guard<std::mutex> lock(write_lock_);
+            // In-place copy is skipped conditionally
+            if (allow_inplace_copy_ops_ || (block != iter->second)) {
+                copy_blocks_[block] = iter->second;
+            } else {
+                in_place_ops_ += 1;
+            }
+            return;
+        }
     }
     std::lock_guard<std::mutex> lock(write_lock_);
     replace_blocks_.push_back(block);
@@ -376,29 +398,83 @@ bool CreateSnapshot::WriteNonOrderedSnapshots() {
     }
     return true;
 }
-
 bool CreateSnapshot::WriteOrderedSnapshots() {
-    std::unordered_map<uint64_t, uint64_t> overwritten_blocks;
-    std::vector<std::pair<uint64_t, uint64_t>> merge_sequence;
-    for (auto it = copy_blocks_.begin(); it != copy_blocks_.end(); it++) {
-        if (overwritten_blocks.count(it->second)) {
-            replace_blocks_.push_back(it->first);
-            continue;
+    // Sort copy_blocks_ by target block index so consecutive
+    // target blocks can be together
+    std::vector<std::pair<uint64_t, uint64_t>> sorted_copy_blocks_(copy_blocks_.begin(),
+                                                                   copy_blocks_.end());
+    std::sort(sorted_copy_blocks_.begin(), sorted_copy_blocks_.end());
+    std::unordered_map<uint64_t, std::vector<uint64_t>> dependency_graph;
+    std::unordered_map<uint64_t, int> in_degree;
+
+    // Initialize in-degree and build the dependency graph
+    for (const auto& [target, source] : sorted_copy_blocks_) {
+        in_degree[target] = 0;
+        if (copy_blocks_.count(source)) {
+            // this source block itself gets modified
+            // Only add a dependency if it's not a self-loop causing it.
+            // An X->X operation should not make X depend on itself in a way that forms a cycle.
+            if (source != target) {
+                dependency_graph[source].push_back(target);
+                in_degree[target]++;
+            }
         }
-        overwritten_blocks[it->first] = it->second;
-        merge_sequence.emplace_back(std::make_pair(it->first, it->second));
+    }
+
+    std::vector<uint64_t> ordered_copy_ops_;
+    std::deque<uint64_t> queue;
+
+    // Add nodes with in-degree 0 (no dependency) to the queue
+    for (const auto& [target, degree] : in_degree) {
+        if (degree == 0) {
+            queue.push_back(target);
+        }
+    }
+
+    while (!queue.empty()) {
+        uint64_t current_target = queue.front();
+        queue.pop_front();
+        ordered_copy_ops_.push_back(current_target);
+
+        if (dependency_graph.count(current_target)) {
+            for (uint64_t neighbor : dependency_graph[current_target]) {
+                in_degree[neighbor]--;
+                if (in_degree[neighbor] == 0) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+    }
+
+    // Detect cycles and change those blocks to replace blocks
+    if (ordered_copy_ops_.size() != copy_blocks_.size()) {
+        LOG(INFO) << "Cycle detected in copy operations! Converting some to replace.";
+        std::unordered_set<uint64_t> safe_targets_(ordered_copy_ops_.begin(),
+                                                   ordered_copy_ops_.end());
+        for (auto it = copy_blocks_.begin(); it != copy_blocks_.end();) {
+            if (safe_targets_.find(it->first) == safe_targets_.end()) {
+                replace_blocks_.push_back(it->first);
+                it = copy_blocks_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::reverse(ordered_copy_ops_.begin(), ordered_copy_ops_.end());
+    // Add the copy blocks
+    copy_ops_ = 0;
+    for (uint64_t target : ordered_copy_ops_) {
+        LOG(DEBUG) << "copy target: " << target << " source: " << copy_blocks_[target];
+        if (!writer_->AddCopy(target, copy_blocks_[target], 1)) {
+            return false;
+        }
+        copy_ops_++;
     }
     // Sort the blocks so that if the blocks are contiguous, it would help
     // compress multiple blocks in one shot based on the compression factor.
     std::sort(replace_blocks_.begin(), replace_blocks_.end());
-
-    copy_ops_ = merge_sequence.size();
-    for (auto it = merge_sequence.begin(); it != merge_sequence.end(); it++) {
-        if (!writer_->AddCopy(it->first, it->second, 1)) {
-            return false;
-        }
-    }
-
+    LOG(DEBUG) << "Total copy ops: " << copy_ops_;
     return true;
 }
 
@@ -567,15 +643,16 @@ bool CreateSnapshot::ParsePartition() {
 
 constexpr char kUsage[] = R"(
 NAME
-    create_snapshot - Create snapshot patches by comparing two partition images
+    create_snapshot - Create snapshot patches
 
 SYNOPSIS
-    create_snapshot --source=<source.img> --target=<target.img> --compression="<compression-algorithm"
+    $create_snapshot --source=<source.img> --target=<target.img> --compression="<compression-algorithm"
 
     source.img -> Source partition image
     target.img -> Target partition image
     compression -> compression algorithm. Default set to lz4. Supported types are gz, lz4, zstd.
     merkel_tree -> If true, source image hash is obtained from verity merkel tree.
+    inplace_copy_ops -> If true, inplace copy ops are added to the snapshot patch.
     output_dir -> Output directory to write the patch file to. Defaults to current working directory if not set.
 
 EXAMPLES
@@ -583,6 +660,7 @@ EXAMPLES
    $ create_snapshot $SOURCE_BUILD/system.img $TARGET_BUILD/system.img
    $ create_snapshot $SOURCE_BUILD/product.img $TARGET_BUILD/product.img --compression="zstd"
    $ create_snapshot $SOURCE_BUILD/product.img $TARGET_BUILD/product.img --merkel_tree --output_dir=/tmp/create_snapshot_output
+   $ create_snapshot $SOURCE_BUILD/product.img $TARGET_BUILD/product.img --inplace_copy_ops
 
 )";
 
@@ -591,7 +669,12 @@ int main(int argc, char* argv[]) {
     ::gflags::SetUsageMessage(kUsage);
     ::gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (FLAGS_source.empty() || FLAGS_target.empty()) {
+    if (FLAGS_target.empty()) {
+        LOG(INFO) << kUsage;
+        return 0;
+    }
+
+    if (FLAGS_target.empty() && !FLAGS_source.empty()) {
         LOG(INFO) << kUsage;
         return 0;
     }
@@ -603,7 +686,8 @@ int main(int argc, char* argv[]) {
         snapshotfile = FLAGS_output_dir + "/" + snapshotfile;
     }
     android::snapshot::CreateSnapshot snapshot(FLAGS_source, FLAGS_target, snapshotfile,
-                                               FLAGS_compression, FLAGS_merkel_tree);
+                                               FLAGS_compression, FLAGS_merkel_tree,
+                                               FLAGS_inplace_copy_ops);
 
     if (!snapshot.CreateSnapshotPatch()) {
         LOG(ERROR) << "Snapshot creation failed";

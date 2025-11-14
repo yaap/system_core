@@ -181,6 +181,7 @@ enum MergeFailureCode {
     MemAlignConsistencyCheck = 18;
     DirectReadConsistencyCheck = 19;
     WrongMergeCountConsistencyCheck = 20;
+    IncorrectMergePhase = 21;
 };
 
 message SnapshotUpdateStatus {

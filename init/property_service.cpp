@@ -117,12 +117,12 @@ static int from_init_socket = -1;
 static int init_socket = -1;
 static bool accept_messages = false;
 static bool weaken_prop_security = false;
-static std::mutex accept_messages_lock;
-static std::mutex selinux_check_access_lock;
-static std::thread property_service_thread;
-static std::thread property_service_for_system_thread;
+[[clang::no_destroy]] static std::mutex accept_messages_lock;
+[[clang::no_destroy]] static std::mutex selinux_check_access_lock;
+[[clang::no_destroy]] static std::thread property_service_thread;
+[[clang::no_destroy]] static std::thread property_service_for_system_thread;
 
-static PropertyInfoAreaFile property_info_area;
+[[clang::no_destroy]] static PropertyInfoAreaFile property_info_area;
 
 struct PropertyAuditData {
     const ucred* cr;
@@ -382,7 +382,7 @@ class PersistWriteThread {
     std::deque<std::tuple<std::string, std::string, SocketConnection>> work_;
 };
 
-static std::unique_ptr<PersistWriteThread> persist_write_thread;
+[[clang::no_destroy]] static std::unique_ptr<PersistWriteThread> persist_write_thread;
 
 static std::optional<uint32_t> PropertySet(const std::string& name, const std::string& value,
                                            SocketConnection* socket, std::string* error) {
@@ -576,7 +576,7 @@ std::optional<uint32_t> HandlePropertySet(const std::string& name, const std::st
     // We use a thread to do this restorecon operation to prevent holding up init, as it may take
     // a long time to complete.
     if (name == kRestoreconProperty && cr.pid != 1 && !value.empty()) {
-        static AsyncRestorecon async_restorecon;
+        [[clang::no_destroy]] static AsyncRestorecon async_restorecon;
         async_restorecon.TriggerRestorecon(value);
         return {PROP_SUCCESS};
     }
@@ -845,13 +845,16 @@ static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>*
 // So we need to apply the same rule of build/make/tools/post_process_props.py
 // on runtime.
 static void update_sys_usb_config() {
-    bool is_debuggable = android::base::GetBoolProperty("ro.debuggable", false);
+    // emulators don't have USB, they enable adb another way.
+    const bool add_adb_func = android::base::GetBoolProperty("ro.debuggable", false) &&
+                              android::base::GetBoolProperty("ro.adb.has_usb", true);
+
     std::string config = android::base::GetProperty("persist.sys.usb.config", "");
     // b/150130503, add (config == "none") condition here to prevent appending
     // ",adb" if "none" is explicitly defined in default prop.
     if (config.empty() || config == "none") {
-        InitPropertySet("persist.sys.usb.config", is_debuggable ? "adb" : "none");
-    } else if (is_debuggable && config.find("adb") == std::string::npos &&
+        InitPropertySet("persist.sys.usb.config", add_adb_func ? "adb" : "none");
+    } else if (add_adb_func && config.find("adb") == std::string::npos &&
                config.length() + 4 < PROP_VALUE_MAX) {
         config.append(",adb");
         InitPropertySet("persist.sys.usb.config", config);

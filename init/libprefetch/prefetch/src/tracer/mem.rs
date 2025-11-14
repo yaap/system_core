@@ -281,6 +281,8 @@ struct TraceLineInfo {
     inode: InodeNumber,
     offset: u64,
     timestamp: u64,
+    // Only supported in kernel 6.x (with page cache folio support).
+    order: Option<u32>,
 }
 
 impl TraceLineInfo {
@@ -294,6 +296,14 @@ impl TraceLineInfo {
         let ino = &caps["ino"];
         let offset = &caps["offset"];
         let timestamp = build_timestamp(&caps["seconds"], &caps["microseconds"])?;
+        let order = caps
+            .name("order")
+            .map(|m| {
+                m.as_str().parse::<u32>().map_err(|e| Error::Custom {
+                    error: format!("failed parsing order: {} : {}", m.as_str(), e),
+                })
+            })
+            .transpose()?;
         Ok(Some(TraceLineInfo {
             device: build_device_number(major, minor)?,
             inode: u64::from_str_radix(ino, 16).map_err(|e| Error::Custom {
@@ -303,6 +313,7 @@ impl TraceLineInfo {
                 error: format!("failed parsing offset: {} : {}", offset, e),
             })?,
             timestamp,
+            order,
         }))
     }
 
@@ -313,8 +324,9 @@ impl TraceLineInfo {
         inode: u64,
         offset: u64,
         timestamp: u64,
+        order: Option<u32>,
     ) -> Self {
-        Self { device: makedev(major, minor), inode, offset, timestamp }
+        Self { device: makedev(major, minor), inode, offset, timestamp, order }
     }
 
     // Convenience function to create regex. Used once per life of `record` but multiple times in
@@ -333,7 +345,7 @@ impl TraceLineInfo {
             r"(?:\s+(?P<page>page=\S+))?",
             r"\s+(?P<pfn>\S+)",
             r"\s+ofs=(?P<offset>[0-9]+)",
-            r"(?:\s+(?P<order>\S+))?"
+            r"(?:\s+order=(?P<order>\S+))?"
         ))
         .map_err(|e| Error::Custom {
             error: format!("create regex for tracing failed with: {}", e),
@@ -523,10 +535,12 @@ impl TraceSubsystem for MemTraceSubsystem {
                 .unwrap()
                 .insert(info.inode, file_id.clone());
 
+            let length = self.page_size << info.order.unwrap_or(0);
+
             self.records.push(Record {
                 file_id,
                 offset: info.offset,
-                length: self.page_size,
+                length,
                 timestamp: info.timestamp,
             });
         }
@@ -699,7 +713,7 @@ mod tests {
         " logcat-686     [001] ..... 148217.776227: mm_filemap_add_to_page_cache: dev 254:85 ino 3f15 pfn=0x21d306 ofs=532480 order=0\n",
         " logcat-686     [003] ..... 148219.044389: mm_filemap_add_to_pag_ecache: dev 254:85 ino 3f15 pfn=0x224b8d ofs=536576 order=0\n",
         " logcat-686     [001] ..... 148220.780964: mm_filemap_add_to_page_cache: dev 254:85 ino 3f15 pfn=0x1bfe0a ofs=540672 order=0\n",
-        " logcat-686     [001] ..... 148223.046560: mm_filemap_add_to_page_cache: dev 254:85 ino 3f15 pfn=0x1f3d29 ofs=544768 order=0",
+        " logcat-686     [001] ..... 148223.046560: mm_filemap_add_to_page_cache: dev 254:85 ino 3f15 pfn=0x1f3d29 ofs=544768 order=1",
     );
 
     fn sample_mem_traces() -> (String, Vec<Option<TraceLineInfo>>) {
@@ -708,19 +722,19 @@ mod tests {
             vec![
                 // 5.x
                 None,
-                Some(TraceLineInfo::from_fields(254, 6, 0xcf1, 57344, 484360311000)),
+                Some(TraceLineInfo::from_fields(254, 6, 0xcf1, 57344, 484360311000, None)),
                 None,
-                Some(TraceLineInfo::from_fields(254, 6, 0xcf2, 0, 485276990000)),
-                Some(TraceLineInfo::from_fields(254, 6, 0x1, 13578240, 485545516000)),
-                Some(TraceLineInfo::from_fields(254, 6, 0xcf3, 0, 485545820000)),
-                Some(TraceLineInfo::from_fields(254, 3, 0x7cf, 1310720, 494029396000)),
-                Some(TraceLineInfo::from_fields(254, 3, 0x7cf, 1314816, 494029398000)),
+                Some(TraceLineInfo::from_fields(254, 6, 0xcf2, 0, 485276990000, None)),
+                Some(TraceLineInfo::from_fields(254, 6, 0x1, 13578240, 485545516000, None)),
+                Some(TraceLineInfo::from_fields(254, 6, 0xcf3, 0, 485545820000, None)),
+                Some(TraceLineInfo::from_fields(254, 3, 0x7cf, 1310720, 494029396000, None)),
+                Some(TraceLineInfo::from_fields(254, 3, 0x7cf, 1314816, 494029398000, None)),
                 // 6.x
                 None,
-                Some(TraceLineInfo::from_fields(254, 85, 0x3f15, 532480, 148217776227000)),
+                Some(TraceLineInfo::from_fields(254, 85, 0x3f15, 532480, 148217776227000, Some(0))),
                 None,
-                Some(TraceLineInfo::from_fields(254, 85, 0x3f15, 540672, 148220780964000)),
-                Some(TraceLineInfo::from_fields(254, 85, 0x3f15, 544768, 148223046560000)),
+                Some(TraceLineInfo::from_fields(254, 85, 0x3f15, 540672, 148220780964000, Some(0))),
+                Some(TraceLineInfo::from_fields(254, 85, 0x3f15, 544768, 148223046560000, Some(1))),
             ],
         )
     }

@@ -458,21 +458,24 @@ bool Modprobe::InsmodWithDeps(const std::string& module_name, const std::string&
 
 bool Modprobe::LoadWithAliases(const std::string& module_name, bool strict,
                                const std::string& parameters) {
-    auto canonical_name = MakeCanonical(module_name);
-    if (module_loaded_.count(canonical_name)) {
-        return true;
-    }
-
-    std::set<std::string> modules_to_load = {canonical_name};
+    std::set<std::string> modules_to_load;
     bool module_loaded = false;
+    {
+        std::lock_guard guard(module_loaded_lock_);
 
-    // use aliases to expand list of modules to load (multiple modules
-    // may alias themselves to the requested name)
-    for (const auto& [alias, aliased_module] : module_aliases_) {
-        if (fnmatch(alias.c_str(), module_name.c_str(), 0) != 0) continue;
-        LOG(VERBOSE) << "Found alias for '" << module_name << "': '" << aliased_module;
-        if (module_loaded_.count(MakeCanonical(aliased_module))) continue;
-        modules_to_load.emplace(aliased_module);
+        auto canonical_name = MakeCanonical(module_name);
+        if (module_loaded_.count(canonical_name)) {
+            return true;
+        }
+        modules_to_load.insert(std::move(canonical_name));
+        // use aliases to expand list of modules to load (multiple modules
+        // may alias themselves to the requested name)
+        for (const auto& [alias, aliased_module] : module_aliases_) {
+            if (fnmatch(alias.c_str(), module_name.c_str(), 0) != 0) continue;
+            LOG(VERBOSE) << "Found alias for '" << module_name << "': '" << aliased_module;
+            if (module_loaded_.count(MakeCanonical(aliased_module))) continue;
+            modules_to_load.emplace(aliased_module);
+        }
     }
 
     // attempt to load all modules aliased to this name

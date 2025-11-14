@@ -16,9 +16,6 @@
 
 #include <poll.h>
 
-#include <string>
-#include <vector>
-
 #include "user-space-merge/snapuserd_server.h"
 
 namespace android {

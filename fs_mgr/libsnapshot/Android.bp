@@ -393,7 +393,6 @@ cc_binary {
         "liblp",
         "libprotobuf-cpp-lite",
         "libsnapshot",
-        "libstatslog",
         "libutils",
     ],
     header_libs: [

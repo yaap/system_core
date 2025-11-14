@@ -79,6 +79,11 @@ bool BlockDevInitializer::InitBootDevicesFromPartUuid() {
     return true;
 }
 
+// Second_stage_init requires loop-control before ueventd starts.
+void BlockDevInitializer::InitLoopDevices() {
+    (void)InitMiscDevice("loop-control");
+}
+
 bool BlockDevInitializer::InitDeviceMapper() {
     return InitMiscDevice("device-mapper");
 }

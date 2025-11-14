@@ -367,9 +367,9 @@ std::shared_ptr<HandlerThread> UserSnapshotServer::AddHandler(const std::string&
         options.num_worker_threads = 1;
     }
 
-    if (options.skip_verification || android::base::EndsWith(misc_name, "-init") ||
-        is_socket_present_ || (access(kBootSnapshotsWithoutSlotSwitch, F_OK) == 0)) {
-        handlers_->DisableVerification();
+    if (android::base::EndsWith(misc_name, "-init") || is_socket_present_ ||
+        (access(kBootSnapshotsWithoutSlotSwitch, F_OK) == 0)) {
+        options.skip_verification = true;
     }
 
     auto opener = block_server_factory_->CreateOpener(misc_name);

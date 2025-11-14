@@ -36,6 +36,7 @@ class BlockDevInitializer final {
     bool InitDmDevice(const std::string& device);
     bool InitPlatformDevice(const std::string& device);
     bool InitHvcDevice(const std::string& device);
+    void InitLoopDevices();
 
   private:
     ListenerAction HandleUevent(const Uevent& uevent, std::set<std::string>* devices);
