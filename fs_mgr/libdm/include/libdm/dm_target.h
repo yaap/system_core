@@ -80,6 +80,10 @@ class DmTarget {
     // must implement this, for it to be used on a device.
     std::string Serialize() const;
 
+    // Returns a string for debugging purposes that contains the target name, start sector and
+    // parameters.
+    std::string DebugString() const;
+
     virtual bool Valid() const { return true; }
 
   protected:
@@ -146,6 +150,7 @@ class DmTargetVerity final : public DmTarget {
     void SetVerityMode(const std::string& mode);
     void IgnoreZeroBlocks();
     void CheckAtMostOnce();
+    void TryVerifyInTasklet();
 
     std::string name() const override { return "verity"; }
     std::string GetParameterString() const override;

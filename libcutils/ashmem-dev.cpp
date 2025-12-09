@@ -34,6 +34,7 @@
 #include <android-base/file.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
+#include <android-base/stringprintf.h>
 #include <android-base/unique_fd.h>
 
 #include "ashmem-internal.h"
@@ -123,10 +124,35 @@ static std::string get_ashmem_device_path() {
     return "/dev/ashmem" + boot_id;
 }
 
+static bool __init_ashmem_rdev() {
+    const std::string ashmem_device_path = get_ashmem_device_path();
+    if (ashmem_device_path.empty()) {
+        return false;
+    }
+
+    struct stat st;
+    if (TEMP_FAILURE_RETRY(stat(ashmem_device_path.c_str(), &st)) == -1) {
+        ALOGE("Unable to stat ashmem device: %m");
+        return false;
+    }
+    if (!S_ISCHR(st.st_mode)) {
+        ALOGE("ashmem device is not a character device");
+        errno = ENOTTY;
+        return false;
+    }
+
+    __ashmem_rdev = st.st_rdev;
+    return true;
+}
+
 int __ashmem_open() {
     static const std::string ashmem_device_path = get_ashmem_device_path();
 
     if (ashmem_device_path.empty()) {
+        return -1;
+    }
+
+    if (__ashmem_rdev == 0 && !__init_ashmem_rdev()) {
         return -1;
     }
 
@@ -136,34 +162,15 @@ int __ashmem_open() {
         return -1;
     }
 
-    struct stat st;
-    if (TEMP_FAILURE_RETRY(fstat(fd, &st)) == -1) {
-        ALOGE("Unable to fstat ashmem device: %m");
-        return -1;
-    }
-    if (!S_ISCHR(st.st_mode) || !st.st_rdev) {
-        ALOGE("ashmem device is not a character device");
-        errno = ENOTTY;
-        return -1;
-    }
-
-    __ashmem_rdev = st.st_rdev;
     return fd.release();
-}
-
-static void __init_ashmem_rdev() {
-    // If __ashmem_rdev hasn't been initialized yet,
-    // create an ashmem fd for that side effect.
-    // This shouldn't happen if all ashmem fds come from us,
-    // but we know that the libcutils code has been copy & pasted.
-    // (Chrome, for example, contains a copy of an old version.)
-    android::base::unique_fd fd(__ashmem_open());
 }
 
 /* Make sure file descriptor references ashmem, negative number means false */
 // TODO: return bool
 static int __ashmem_is_ashmem(int fd, bool fatal) {
-    if (__ashmem_rdev == 0) __init_ashmem_rdev();
+    if (__ashmem_rdev == 0 && !__init_ashmem_rdev()) {
+        return -1;
+    }
 
     struct stat st;
     if (fstat(fd, &st) == -1) return -1;
@@ -189,23 +196,14 @@ static int __ashmem_check_failure(int fd, int result) {
     return result;
 }
 
-static bool is_ashmem_fd(int fd) {
-    static bool fd_check_error_once = false;
-
-    if (__ashmem_is_ashmem(fd, false) == 0) {
-        if (!fd_check_error_once) {
-            ALOGE("memfd: memfd expected but ashmem fd used - please use libcutils");
-            fd_check_error_once = true;
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
 static bool is_memfd_fd(int fd) {
-    return has_memfd_support() && !is_ashmem_fd(fd);
+    std::string fd_path = android::base::StringPrintf("/proc/self/fd/%d", fd);
+    std::string result;
+    if (!android::base::Readlink(fd_path, &result)) {
+        ALOGE("readlink(%s) failed: %m", fd_path.c_str());
+        return false;
+    }
+    return result.starts_with("/memfd:");
 }
 
 int ashmem_valid(int fd) {
@@ -259,8 +257,8 @@ int ashmem_create_region(const char* name, size_t size) {
 
     android::base::unique_fd fd(__ashmem_open());
     if (!fd.ok() ||
-        TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_NAME, name) < 0) ||
-        TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_SIZE, size) < 0)) {
+        TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_NAME, name)) < 0 ||
+        TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_SIZE, size)) < 0) {
         return -1;
     }
     return fd.release();

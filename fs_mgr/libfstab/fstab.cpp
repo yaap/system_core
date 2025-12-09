@@ -660,6 +660,9 @@ void TransformFstabForDsu(Fstab* fstab, const std::string& dsu_slot,
                 entry->blk_device = android::gsi::kDsuUserdata;
                 entry->fs_mgr_flags.logical = true;
                 entry->fs_mgr_flags.formattable = true;
+                entry->fs_mgr_flags.is_zoned = false;
+                entry->user_devices.clear();
+                entry->device_aliased.clear();
                 if (!entry->metadata_key_dir.empty()) {
                     entry->metadata_key_dir = android::gsi::GetDsuMetadataKeyDir(dsu_slot);
                 }

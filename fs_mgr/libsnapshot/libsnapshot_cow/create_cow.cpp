@@ -36,10 +36,14 @@
 
 DEFINE_string(source, "", "Source partition image");
 DEFINE_string(target, "", "Target partition image");
+DEFINE_uint64(partition_size, 0,
+              "Size of the target partition in bytes. Used when source and target images are not "
+              "available.");
 DEFINE_string(
         output_dir, "",
         "Output directory to write the patch file to. Defaults to current working directory if "
         "not set.");
+DEFINE_string(output_file, "", "Output file name for the patch. Overrides --output_dir.");
 DEFINE_string(compression, "lz4",
               "Compression algorithm. Default is set to lz4. Available options: lz4, zstd, gz");
 DEFINE_bool(merkel_tree, false, "If true, source image hash is obtained from verity merkel tree");
@@ -58,8 +62,9 @@ using android::snapshot::ICowWriter;
 class CreateSnapshot {
   public:
     CreateSnapshot(const std::string& src_file, const std::string& target_file,
-                   const std::string& patch_file, const std::string& compression,
-                   const bool& merkel_tree, const bool& inplace_copy_ops);
+                   uint64_t partition_size, const std::string& patch_file,
+                   const std::string& compression, const bool& merkel_tree,
+                   const bool& inplace_copy_ops);
     bool CreateSnapshotPatch();
 
   private:
@@ -67,6 +72,8 @@ class CreateSnapshot {
     std::string src_file_;
     /* target.img */
     std::string target_file_;
+    /* size of target partition when source/target images are not available */
+    uint64_t partition_size_ = 0;
     /* snapshot-patch generated */
     std::string patch_file_;
 
@@ -105,6 +112,7 @@ class CreateSnapshot {
     bool ReadBlocks(off_t offset, const int skip_blocks, const uint64_t dev_sz);
     std::string ToHexString(const uint8_t* buf, size_t len);
 
+    bool CreateNoOpSnapshot();
     bool CreateSnapshotFullOta();
     bool CreateSnapshotFile();
     bool FindSourceBlockHash();
@@ -139,10 +147,12 @@ void CreateSnapshotLogger(android::base::LogId, android::base::LogSeverity sever
 }
 
 CreateSnapshot::CreateSnapshot(const std::string& src_file, const std::string& target_file,
-                               const std::string& patch_file, const std::string& compression,
-                               const bool& merkel_tree, const bool& inplace_copy_ops)
+                               uint64_t partition_size, const std::string& patch_file,
+                               const std::string& compression, const bool& merkel_tree,
+                               const bool& inplace_copy_ops)
     : src_file_(src_file),
       target_file_(target_file),
+      partition_size_(partition_size),
       patch_file_(patch_file),
       use_merkel_tree_(merkel_tree),
       allow_inplace_copy_ops_(inplace_copy_ops) {
@@ -257,6 +267,29 @@ bool CreateSnapshot::ParseSourceMerkelTree() {
 }
 
 /*
+ * Create no-op snapshot patch, that is, a patch that leaves the target
+ * partition intact.
+ */
+bool CreateSnapshot::CreateNoOpSnapshot() {
+    if (!IsBlockAligned(partition_size_)) {
+        LOG(ERROR) << "partition_size_: " << partition_size_ << " is not block aligned";
+        return false;
+    }
+
+    cow_fd_.reset(open(patch_file_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666));
+    if (cow_fd_ < 0) {
+        PLOG(ERROR) << "Failed to open the snapshot-patch file: " << patch_file_;
+        return false;
+    }
+
+    if (!WriteV3Snapshots()) {
+        LOG(ERROR) << "Snapshot Write failed";
+        return false;
+    }
+    return true;
+}
+
+/*
  * Create snapshot file by comparing sha256 per block
  * of target.img with the constructed per-block sha256 hash
  * of source partition.
@@ -279,6 +312,9 @@ bool CreateSnapshot::CreateSnapshotFullOta() {
  * Creates snapshot patch file by comparing source.img and target.img
  */
 bool CreateSnapshot::CreateSnapshotPatch() {
+    if (partition_size_ > 0) {
+        return CreateNoOpSnapshot();
+    }
     if (!incremental_) {
         return CreateSnapshotFullOta();
     }
@@ -349,7 +385,10 @@ size_t CreateSnapshot::PrepareWrite(size_t* pending_ops, size_t start_index) {
 }
 
 bool CreateSnapshot::CreateSnapshotWriter() {
-    uint64_t dev_sz = lseek(target_fd_.get(), 0, SEEK_END);
+    uint64_t dev_sz = partition_size_;
+    if (partition_size_ == 0) {
+        dev_sz = lseek(target_fd_.get(), 0, SEEK_END);
+    }
     CowOptions options;
     options.compression = compression_;
     options.num_compress_threads = 2;
@@ -650,17 +689,23 @@ SYNOPSIS
 
     source.img -> Source partition image
     target.img -> Target partition image
+    partition_size -> Size of the target partition in bytes. Used when source and target images are not available.
+                      Cannot be used with --source and --target. Creates a "no-op" patch that leaves the target
+                      partition intact.
     compression -> compression algorithm. Default set to lz4. Supported types are gz, lz4, zstd.
     merkel_tree -> If true, source image hash is obtained from verity merkel tree.
     inplace_copy_ops -> If true, inplace copy ops are added to the snapshot patch.
     output_dir -> Output directory to write the patch file to. Defaults to current working directory if not set.
+    output_file -> Output file name for the patch. Overrides --output_dir.
 
 EXAMPLES
 
    $ create_snapshot $SOURCE_BUILD/system.img $TARGET_BUILD/system.img
    $ create_snapshot $SOURCE_BUILD/product.img $TARGET_BUILD/product.img --compression="zstd"
    $ create_snapshot $SOURCE_BUILD/product.img $TARGET_BUILD/product.img --merkel_tree --output_dir=/tmp/create_snapshot_output
+   $ create_snapshot $SOURCE_BUILD/product.img $TARGET_BUILD/product.img --output_file=/tmp/my.patch
    $ create_snapshot $SOURCE_BUILD/product.img $TARGET_BUILD/product.img --inplace_copy_ops
+   $ create_snapshot --partition_size=1048576 --output_file=/tmp/my.patch
 
 )";
 
@@ -669,9 +714,18 @@ int main(int argc, char* argv[]) {
     ::gflags::SetUsageMessage(kUsage);
     ::gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (FLAGS_target.empty()) {
-        LOG(INFO) << kUsage;
-        return 0;
+    if (FLAGS_partition_size > 0) {
+        // If --partition_size is specified, --source and --target must NOT be set.
+        if (!FLAGS_source.empty() || !FLAGS_target.empty()) {
+            LOG(INFO) << kUsage;
+            return 1;
+        }
+    } else {
+        // Otherwise, --target is required.
+        if (FLAGS_target.empty()) {
+            LOG(INFO) << kUsage;
+            return 0;
+        }
     }
 
     if (FLAGS_target.empty() && !FLAGS_source.empty()) {
@@ -679,14 +733,19 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::string fname = android::base::Basename(FLAGS_target.c_str());
-    auto parts = android::base::Split(fname, ".");
-    std::string snapshotfile = parts[0] + ".patch";
-    if (!FLAGS_output_dir.empty()) {
-        snapshotfile = FLAGS_output_dir + "/" + snapshotfile;
+    std::string snapshotfile;
+    if (!FLAGS_output_file.empty()) {
+        snapshotfile = FLAGS_output_file;
+    } else {
+        std::string fname = android::base::Basename(FLAGS_target.c_str());
+        auto parts = android::base::Split(fname, ".");
+        snapshotfile = parts[0] + ".patch";
+        if (!FLAGS_output_dir.empty()) {
+            snapshotfile = FLAGS_output_dir + "/" + snapshotfile;
+        }
     }
-    android::snapshot::CreateSnapshot snapshot(FLAGS_source, FLAGS_target, snapshotfile,
-                                               FLAGS_compression, FLAGS_merkel_tree,
+    android::snapshot::CreateSnapshot snapshot(FLAGS_source, FLAGS_target, FLAGS_partition_size,
+                                               snapshotfile, FLAGS_compression, FLAGS_merkel_tree,
                                                FLAGS_inplace_copy_ops);
 
     if (!snapshot.CreateSnapshotPatch()) {

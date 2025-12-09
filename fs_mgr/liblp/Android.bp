@@ -129,3 +129,18 @@ filegroup {
     name: "TestPartitionOpener_group",
     srcs: ["test_partition_opener.cpp"],
 }
+
+cc_binary {
+    name: "lpmodify",
+    defaults: ["fs_mgr_defaults"],
+    host_supported: true,
+    srcs: ["lpmodify.cc"],
+    shared_libs: [
+        "liblp",
+        "libbase",
+    ],
+    cflags: [
+        "-D_FILE_OFFSET_BITS=64",
+        "-Werror",
+    ],
+}

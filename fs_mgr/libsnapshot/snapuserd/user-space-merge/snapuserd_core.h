@@ -45,6 +45,7 @@
 #include <storage_literals/storage_literals.h>
 #include <system/thread_defs.h>
 #include <user-space-merge/handler_manager.h>
+#include "snapuserd/snapuserd_common.h"
 #include "snapuserd_readahead.h"
 #include "snapuserd_verify.h"
 
@@ -214,7 +215,10 @@ class SnapshotHandler : public std::enable_shared_from_this<SnapshotHandler> {
     std::mutex lock_;
     std::condition_variable cv;
 
-    // Lock the buffer used for snapshot-merge
+    // Lock the buffer used for snapshot-merge.
+    //
+    // Lock ordering: If both buffer_lock_ and MergeGroupState::m_lock need
+    // to be held, buffer_lock_ MUST be acquired first.
     std::mutex buffer_lock_;
 
     void* mapped_addr_;

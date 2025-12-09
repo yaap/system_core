@@ -149,7 +149,7 @@ static constexpr std::chrono::nanoseconds kCommandRetryTimeout = 5s;
 static Result<void> reboot_into_recovery(const std::vector<std::string>& options) {
     LOG(ERROR) << "Rebooting into recovery";
     std::string err;
-    if (!write_bootloader_message(options, &err)) {
+    if (!IsMicrodroid() && !write_bootloader_message(options, &err)) {
         return Error() << "Failed to set bootloader message: " << err;
     }
     trigger_shutdown("reboot,recovery");

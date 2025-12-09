@@ -304,9 +304,9 @@ bool SnapshotHandler::Start() {
     if (ra_thread_) {
         ra_thread_status =
                 std::async(std::launch::async, &ReadAhead::RunThread, read_ahead_thread_.get());
-        // If this is a merge-resume path, wait until RA thread is fully up as
-        // the data has to be re-constructed from the scratch space.
-        if (resume_merge_ && ShouldReconstructDataFromCow()) {
+        // If the data has to be re-constructed from scratch space,
+        // wait until RA thread is fully up.
+        if (ShouldReconstructDataFromCow()) {
             WaitForRaThreadToStart();
         }
     }

@@ -49,6 +49,8 @@ class Daemon {
     void MaskAllSignalsExceptIntAndTerm();
     void MaskAllSignals();
     static void SignalHandler(int signal);
+    bool SendUeventRequest(int socket, const std::string& device_path);
+    bool SendDoneNotification(int socket_fd);
 };
 
 }  // namespace snapshot

@@ -149,6 +149,7 @@ class [[nodiscard]] AutoNotifyReadAheadFailed {
 };
 
 bool ReadAhead::ReconstructDataFromCow() {
+    std::unique_lock<std::mutex> lock(snapuserd_->GetBufferLock());
     std::unordered_map<uint64_t, void*>& read_ahead_buffer_map = snapuserd_->GetReadAheadMap();
     loff_t metadata_offset = 0;
     loff_t start_data_offset = snapuserd_->GetBufferDataOffset();
@@ -203,6 +204,8 @@ bool ReadAhead::ReconstructDataFromCow() {
 
         break;
     }
+
+    lock.unlock();
 
     snapuserd_->SetMergedBlockCountForNextCommit(total_blocks_merged);
 
@@ -328,7 +331,6 @@ bool ReadAhead::ReadAheadAsyncIO() {
 
             pending_sqe -= 1;
             pending_ios_to_submit += 1;
-            sqe->flags |= IOSQE_ASYNC;
         }
 
         // pending_sqe == 0 : Ring is full
@@ -698,6 +700,9 @@ bool ReadAhead::ReadAheadIOStart() {
 
     SNAP_LOG(DEBUG) << "Read-ahead: total_ra_blocks_merged: " << total_ra_blocks_completed_;
 
+    // Invalidate page-cache pages.
+    posix_fadvise(backing_store_fd_.get(), 0, 0, POSIX_FADV_DONTNEED);
+
     // Wait for the merge to finish for the previous RA window. We shouldn't
     // be touching the scratch space until merge is complete of previous RA
     // window. If there is a crash during this time frame, merge should resume
@@ -755,9 +760,7 @@ bool ReadAhead::InitializeIouring() {
 
     ring_ = std::make_unique<struct io_uring>();
 
-    int ret = io_uring_queue_init(queue_depth_, ring_.get(), 0);
-    if (ret) {
-        SNAP_LOG(ERROR) << "io_uring_queue_init failed with ret: " << ret;
+    if (!InitializeUringForMerge(ring_.get(), queue_depth_)) {
         return false;
     }
 
@@ -795,7 +798,7 @@ bool ReadAhead::RunThread() {
 
     InitializeIouring();
 
-    if (!SetThreadPriority(ANDROID_PRIORITY_BACKGROUND)) {
+    if (!SetThreadPriority(ANDROID_PRIORITY_NORMAL)) {
         SNAP_PLOG(ERROR) << "Failed to set thread priority";
     }
 

@@ -32,6 +32,7 @@
 
 #include <android-base/file.h>
 #include <android-base/strings.h>
+#include <android-base/test_utils.h>
 
 // We test both kinds of logging.
 #include <android-base/logging.h>
@@ -182,8 +183,8 @@ noinline void sigsegv_write() {
 }
 
 noinline void sigsegv_read() {
-  int* a = reinterpret_cast<int*>(0xdeadbeef);
-  int value = *a;
+  volatile int* a = reinterpret_cast<volatile int*>(0xdeadbeef);
+  android::base::DoNotOptimize(*a);
 }
 
 noinline void fprintf_null() {

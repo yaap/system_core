@@ -16,8 +16,9 @@
 
 #pragma once
 
+#include <modprobe/module_config.h>
+
 #include <atomic>
-#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -31,6 +32,7 @@ class Modprobe {
   public:
     Modprobe(const std::vector<std::string>&, const std::string load_file = "modules.load",
              bool use_blocklist = true);
+    Modprobe(ModuleConfig config, bool use_blocklist = true);
 
     bool LoadModulesParallel(int num_threads) EXCLUDES(module_loaded_lock_);
     bool LoadListedModules(bool strict = true);
@@ -45,26 +47,12 @@ class Modprobe {
     bool IsBlocklisted(const std::string& module_name);
 
   private:
-    std::string MakeCanonical(const std::string& module_path);
     bool InsmodWithDeps(const std::string& module_name, const std::string& parameters);
     bool Insmod(const std::string& path_name, const std::string& parameters)
             EXCLUDES(module_loaded_lock_);
     bool Rmmod(const std::string& module_name) EXCLUDES(module_loaded_lock_);
     std::vector<std::string> GetDependencies(const std::string& module);
     bool ModuleExists(const std::string& module_name);
-    void AddOption(const std::string& module_name, const std::string& option_name,
-                   const std::string& value);
-    std::string GetKernelCmdline();
-
-    bool ParseDepCallback(const std::string& base_path, const std::vector<std::string>& args);
-    bool ParseAliasCallback(const std::vector<std::string>& args);
-    bool ParseSoftdepCallback(const std::vector<std::string>& args);
-    bool ParseLoadCallback(const std::vector<std::string>& args);
-    bool ParseOptionsCallback(const std::vector<std::string>& args);
-    bool ParseDynOptionsCallback(const std::vector<std::string>& args);
-    bool ParseBlocklistCallback(const std::vector<std::string>& args);
-    void ParseKernelCmdlineOptions();
-    void ParseCfg(const std::string& cfg, std::function<bool(const std::vector<std::string>&)> f);
 
     // These non const fields are initialized by the constructor and never be modified.
     std::vector<std::pair<std::string, std::string>> module_aliases_;

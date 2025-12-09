@@ -58,6 +58,9 @@ subsystem vfio
 # kms driver for drm based gpu
 /dev/dri/*                0666   root       graphics
 
+# udmabuf driver
+/dev/udmabuf              0666   root       root
+
 # these should not be world writable
 /dev/uhid                 0660   uhid       uhid
 /dev/uinput               0660   uhid       uhid

@@ -394,7 +394,8 @@ bool CowReader::GetSequenceDataV2(std::vector<uint32_t>* merge_op_blocks,
     return false;
 }
 
-bool CowReader::GetSequenceData(std::vector<uint32_t>* merge_op_blocks, std::vector<uint32_t>* other_ops,
+bool CowReader::GetSequenceData(std::vector<uint32_t>* merge_op_blocks,
+                                std::vector<uint32_t>* other_ops,
                                 std::unordered_map<uint32_t, int>* block_map) {
     std::unordered_set<uint32_t> seq_ops_set;
     // read sequence ops data
@@ -674,11 +675,7 @@ bool CowReader::GetRawBytes(uint64_t offset, void* buffer, size_t len, size_t* r
         LOG(ERROR) << "invalid data offset: " << offset << ", " << len << " bytes";
         return false;
     }
-    if (lseek(fd_.get(), offset, SEEK_SET) < 0) {
-        PLOG(ERROR) << "lseek to read raw bytes failed";
-        return false;
-    }
-    ssize_t rv = TEMP_FAILURE_RETRY(::read(fd_.get(), buffer, len));
+    ssize_t rv = TEMP_FAILURE_RETRY(::pread(fd_.get(), buffer, len, offset));
     if (rv < 0) {
         PLOG(ERROR) << "read failed";
         return false;
@@ -734,9 +731,6 @@ ssize_t CowReader::ReadData(const CowOperation* op, void* buffer, size_t buffer_
             break;
         case kCowCompressGz:
             decompressor = IDecompressor::Gz();
-            break;
-        case kCowCompressBrotli:
-            decompressor = IDecompressor::Brotli();
             break;
         case kCowCompressZstd:
             if (op_buf_size != op->data_length) {

@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <android-base/chrono_utils.h>
+
 #include "result.h"
 #include "uevent.h"
 #include "uevent_handler.h"
@@ -51,14 +53,16 @@ class FirmwareHandler : public UeventHandler {
 
     void HandleUevent(const Uevent& uevent) override;
     void ColdbootDone() override;
+    void EnqueueUevent(const Uevent& uevent, ThreadPool& thread_pool) override;
 
   private:
     friend void FirmwareTestWithExternalHandler(const std::string& test_name,
                                                 bool expect_new_firmware);
-    void HandleUeventInternal(const Uevent& uevent) const;
+    void HandleUeventInternal(const Uevent& uevent, bool in_thread_pool) const;
 
     std::string GetFirmwarePath(const Uevent& uevent) const;
-    void ProcessFirmwareEvent(const std::string& path, const std::string& firmware) const;
+    void ProcessFirmwareEvent(const std::string& path, const std::string& firmware,
+                              bool in_thread_pool, base::Timer t) const;
     bool ForEachFirmwareDirectory(std::function<bool(const std::string&)> handler) const;
 
     std::atomic_bool enables_parallel_handlers_ = true;

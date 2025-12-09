@@ -129,39 +129,37 @@ static bool FindDmDevice(const Uevent& uevent, std::string* name, std::string* u
 
 Permissions::Permissions(const std::string& name, mode_t perm, uid_t uid, gid_t gid,
                          bool no_fnm_pathname)
-    : name_(name),
-      perm_(perm),
-      uid_(uid),
-      gid_(gid),
-      prefix_(false),
-      wildcard_(false),
-      no_fnm_pathname_(no_fnm_pathname) {
-    // Set 'prefix_' or 'wildcard_' based on the below cases:
+    : name_(name), perm_(perm), uid_(uid), gid_(gid), no_fnm_pathname_(no_fnm_pathname) {
+    // Set 'match_type_' based on the below cases:
     //
-    // 1) No '*' in 'name' -> Neither are set and Match() checks a given path for strict
+    // 1) No '*' in 'name' -> 'match_type_' is kExact and Match() checks a given path for strict
     //    equality with 'name'
     //
-    // 2) '*' only appears as the last character in 'name' -> 'prefix'_ is set to true and
+    // 2) '*' only appears as the last character in 'name' -> 'match_type_' is kPrefix and
     //    Match() checks if 'name' is a prefix of a given path.
     //
-    // 3) '*' appears elsewhere -> 'wildcard_' is set to true and Match() uses fnmatch()
-    //    with FNM_PATHNAME to compare 'name' to a given path.
+    // 3) '*' appears elsewhere -> 'match_type_' is kWildcard and Match() uses fnmatch()
+    //    with FNM_PATHNAME (unless no_fnm_pathname is set) to compare 'name' to a given path.
     auto wildcard_position = name_.find('*');
-    if (wildcard_position != std::string::npos) {
-        if (wildcard_position == name_.length() - 1) {
-            prefix_ = true;
-            name_.pop_back();
-        } else {
-            wildcard_ = true;
-        }
+    if (wildcard_position == std::string::npos) {
+        match_type_ = PathMatchType::kExact;
+    } else if (wildcard_position == name_.length() - 1) {
+        match_type_ = PathMatchType::kPrefix;
+        name_.pop_back();
+    } else {
+        match_type_ = PathMatchType::kWildcard;
     }
 }
 
 bool Permissions::Match(const std::string& path) const {
-    if (prefix_) return StartsWith(path, name_);
-    if (wildcard_)
-        return fnmatch(name_.c_str(), path.c_str(), no_fnm_pathname_ ? 0 : FNM_PATHNAME) == 0;
-    return path == name_;
+    switch (match_type_) {
+        case PathMatchType::kExact:
+            return path == name_;
+        case PathMatchType::kPrefix:
+            return StartsWith(path, name_);
+        case PathMatchType::kWildcard:
+            return fnmatch(name_.c_str(), path.c_str(), no_fnm_pathname_ ? 0 : FNM_PATHNAME) == 0;
+    }
 }
 
 bool SysfsPermissions::MatchWithSubsystem(const std::string& path,
@@ -794,6 +792,8 @@ void DeviceHandler::HandleUevent(const Uevent& uevent) {
         devpath = "/dev/dm-user/" + uevent.device_name.substr(8);
     } else if (uevent.subsystem == "misc" && uevent.device_name == "vfio/vfio") {
         devpath = "/dev/" + uevent.device_name;
+    } else if (uevent.subsystem == "misc" && StartsWith(uevent.device_name, "ublk")) {
+        devpath = "/dev/" + uevent.device_name;
     } else {
         devpath = "/dev/" + Basename(uevent.path);
     }
@@ -809,6 +809,10 @@ void DeviceHandler::HandleUevent(const Uevent& uevent) {
 
 void DeviceHandler::ColdbootDone() {
     skip_restorecon_ = false;
+}
+
+void DeviceHandler::EnqueueUevent(const Uevent& uevent, ThreadPool& thread_pool) {
+    thread_pool.Enqueue(kPriorityDevice, [this, uevent]() { HandleUevent(uevent); });
 }
 
 DeviceHandler::DeviceHandler(std::vector<Permissions> dev_permissions,

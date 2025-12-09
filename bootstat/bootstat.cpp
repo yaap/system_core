@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <ctime>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -56,6 +57,11 @@ struct AtomInfo {
   int32_t atom;
   int32_t event;
 };
+
+// Identifier for the firmware boot 'splash' screen stage on desktop. This stage
+// timing is already included in the 'firmware' part of the boot sequence, so it
+// must not calculated twice when summing together all boot stages.
+const std::string_view FIRMWARE_SPLASH = "splash";
 
 // Maps BootEvent used inside bootstat into statsd atom defined in
 // frameworks/proto_logging/stats/atoms.proto.
@@ -153,9 +159,14 @@ void LogBootEvents() {
                                               static_cast<int32_t>(info->second.event),
                                               static_cast<int32_t>(event.second));
       } else {
+        int64_t value = static_cast<int64_t>(event.second);
+        // ro.boottime.init is recorded in ns, but we want to report it to
+        // statsd in ms.
+        if (name == "ro.boottime.init") {
+          value /= 1000000;
+        }
         android::util::bootstats::stats_write(static_cast<int32_t>(info->second.atom),
-                                              static_cast<int32_t>(info->second.event),
-                                              static_cast<int64_t>(event.second));
+                                              static_cast<int32_t>(info->second.event), value);
       }
     } else {
       notSupportedEvents.push_back(name);
@@ -1153,29 +1164,27 @@ std::string BootReasonStrToReason(const std::string& boot_reason) {
 // bookkeeping required to track when a system update has occurred by storing
 // the UTC timestamp of the system build date and comparing against the current
 // system build date.
-std::string CalculateBootCompletePrefix() {
+std::string_view CalculateBootCompletePrefix() {
   static const std::string kBuildDateKey = "build_date";
-  std::string boot_complete_prefix = "boot_complete";
 
   auto build_date_str = android::base::GetProperty("ro.build.date.utc", "");
   int32_t build_date;
   if (!android::base::ParseInt(build_date_str, &build_date)) {
-    return std::string();
+    return std::string_view();
   }
 
   BootEventRecordStore boot_event_store;
   BootEventRecordStore::BootEventRecord record;
   if (!boot_event_store.GetBootEvent(kBuildDateKey, &record)) {
-    boot_complete_prefix = "factory_reset_" + boot_complete_prefix;
     boot_event_store.AddBootEventWithValue(kBuildDateKey, build_date);
     BootReasonAddToHistory("reboot,factory_reset");
+    return BootEventRecordStore::kFactoryResetBootCompletePrefix;
   } else if (build_date != record.second) {
-    boot_complete_prefix = "ota_" + boot_complete_prefix;
     boot_event_store.AddBootEventWithValue(kBuildDateKey, build_date);
     BootReasonAddToHistory("reboot,ota");
+    return BootEventRecordStore::kOtaBootCompletePrefix;
   }
-
-  return boot_complete_prefix;
+  return BootEventRecordStore::kBootCompletePrefix;
 }
 
 // Records the value of a given ro.boottime.init property in milliseconds.
@@ -1222,9 +1231,12 @@ const BootloaderTimingMap GetBootLoaderTimings() {
 }
 
 // Returns the total bootloader boot time from the ro.boot.boottime system property.
-int32_t GetBootloaderTime(const BootloaderTimingMap& bootloader_timings) {
+int32_t GetBootloaderTime(const BootloaderTimingMap& bootloader_timings,
+                          const std::initializer_list<std::string_view>& skipped) {
   int32_t total_time = 0;
   for (const auto& timing : bootloader_timings) {
+    // Skip any metric that should not be used in the total time calculation.
+    if (std::find(skipped.begin(), skipped.end(), timing.first) != skipped.end()) continue;
     total_time += timing.second;
   }
 
@@ -1234,28 +1246,19 @@ int32_t GetBootloaderTime(const BootloaderTimingMap& bootloader_timings) {
 // Parses and records the set of bootloader stages and associated boot times
 // from the ro.boot.boottime system property.
 void RecordBootloaderTimings(BootEventRecordStore* boot_event_store,
-                             const BootloaderTimingMap& bootloader_timings) {
-  int32_t total_time = 0;
+                             const BootloaderTimingMap& bootloader_timings,
+                             const int32_t bootloader_boot_duration) {
   for (const auto& timing : bootloader_timings) {
-    total_time += timing.second;
     boot_event_store->AddBootEventWithValue("boottime.bootloader." + timing.first, timing.second);
   }
-
-  boot_event_store->AddBootEventWithValue("boottime.bootloader.total", total_time);
+  boot_event_store->AddBootEventWithValue("boottime.bootloader.total", bootloader_boot_duration);
 }
 
 // Returns the closest estimation to the absolute device boot time, i.e.,
 // from power on to boot_complete, including bootloader times.
 std::chrono::milliseconds GetAbsoluteBootTime(const BootloaderTimingMap& bootloader_timings,
                                               std::chrono::milliseconds uptime) {
-  int32_t bootloader_time_ms = 0;
-
-  for (const auto& timing : bootloader_timings) {
-    if (timing.first.compare("SW") != 0) {
-      bootloader_time_ms += timing.second;
-    }
-  }
-
+  int32_t bootloader_time_ms = GetBootloaderTime(bootloader_timings, {FIRMWARE_SPLASH, "SW"});
   auto bootloader_duration = std::chrono::milliseconds(bootloader_time_ms);
   return bootloader_duration + uptime;
 }
@@ -1337,7 +1340,7 @@ void RecordBootComplete() {
   BootEventRecordStore::BootEventRecord record;
 
   auto uptime_ns = GetUptime();
-  auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(uptime_ns);
+  auto uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(uptime_ns);
   time_t current_time_utc = time(nullptr);
   time_t time_since_last_boot = 0;
 
@@ -1352,23 +1355,14 @@ void RecordBootComplete() {
   // The boot_complete metric has two variants: boot_complete and
   // ota_boot_complete.  The latter signifies that the device is booting after
   // a system update.
-  std::string boot_complete_prefix = CalculateBootCompletePrefix();
+  std::string_view boot_complete_prefix = CalculateBootCompletePrefix();
   if (boot_complete_prefix.empty()) {
     // The system is hosed because the build date property could not be read.
     return;
   }
 
-  // The *_no_encryption events are emitted unconditionally, since they are left
-  // over from a time when encryption meant "full-disk encryption".  But Android
-  // now always uses file-based encryption instead of full-disk encryption.  At
-  // some point, these misleading and redundant events should be removed.
-  boot_event_store.AddBootEventWithValue(boot_complete_prefix + "_no_encryption",
-                                         uptime_s.count());
-
-  // Record the total time from device startup to boot complete.  Note: we are
-  // recording seconds here even though the field in statsd atom specifies
-  // milliseconds.
-  boot_event_store.AddBootEventWithValue(boot_complete_prefix, uptime_s.count());
+  // Record the total time from device startup to boot complete.
+  boot_event_store.AddBootEventWithValue(std::string(boot_complete_prefix), uptime_ms.count());
 
   RecordInitBootTimeProp(&boot_event_store, "ro.boottime.init");
   RecordInitBootTimeProp(&boot_event_store, "ro.boottime.init.first_stage");
@@ -1376,10 +1370,9 @@ void RecordBootComplete() {
   RecordInitBootTimeProp(&boot_event_store, "ro.boottime.init.cold_boot_wait");
 
   const BootloaderTimingMap bootloader_timings = GetBootLoaderTimings();
-  int32_t bootloader_boot_duration = GetBootloaderTime(bootloader_timings);
-  RecordBootloaderTimings(&boot_event_store, bootloader_timings);
+  const int32_t bootloader_boot_duration = GetBootloaderTime(bootloader_timings, {FIRMWARE_SPLASH});
+  RecordBootloaderTimings(&boot_event_store, bootloader_timings, bootloader_boot_duration);
 
-  auto uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(uptime_ns);
   auto absolute_boot_time = GetAbsoluteBootTime(bootloader_timings, uptime_ms);
   RecordAbsoluteBootTime(&boot_event_store, absolute_boot_time);
 

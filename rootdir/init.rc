@@ -353,6 +353,7 @@ on init
     write /proc/sys/kernel/sched_child_runs_first 0
 
     write /proc/sys/kernel/randomize_va_space 2
+    write /proc/sys/kernel/kptr_restrict 2
     write /proc/sys/vm/mmap_min_addr 32768
     write /proc/sys/net/ipv4/ping_group_range "0 2147483647"
     write /proc/sys/net/unix/max_dgram_qlen 2400
@@ -487,7 +488,7 @@ on init
 
     # make the PSI monitor accessible to others
     chown system system /proc/pressure/memory
-    chmod 0664 /proc/pressure/memory
+    chmod 0666 /proc/pressure/memory
 
     mount bpf bpf /sys/fs/bpf nodev noexec nosuid
 
@@ -807,7 +808,6 @@ on post-fs-data
     mkdir /data/property 0700 root root encryption=Require
     load_persist_props
 
-    start logd
     start logd-reinit
 
     # Some existing vendor rc files use 'on load_persist_props_action' to know
@@ -921,6 +921,10 @@ on post-fs-data
     # directory used for connectivity blob store.
     mkdir /data/misc/connectivityblobdb 0770 system system
 
+    # Setup SurfaceFlinger shader caching
+    mkdir /data/misc/surfaceflinger 0700 system system
+    setprop service.sf.cache_dir_available 1
+
     # Directory for VirtualizationService temporary image files.
     # Delete any stale files owned by the old virtualizationservice uid (b/230056726).
     chmod 0770 /data/misc/virtualizationservice
@@ -966,7 +970,7 @@ on post-fs-data
     mkdir /data/ota 0771 root root encryption=Require
 
     # create the OTA package directory. It will be accessed by GmsCore (cache
-    # group), update_engine and update_verifier.
+    # group), update_engine
     mkdir /data/ota_package 0770 system cache encryption=Require
 
     # create resource-cache and double-check the perms
@@ -1093,6 +1097,7 @@ on post-fs-data
 
     # Create directories for statsd
     mkdir /data/misc/stats-active-metric/ 0770 statsd system
+    mkdir /data/misc/stats-atoms/ 0775 statsd system
     mkdir /data/misc/stats-data/ 0770 statsd system
     mkdir /data/misc/stats-data/restricted-data 0770 statsd system
     mkdir /data/misc/stats-metadata/ 0770 statsd system
@@ -1173,7 +1178,16 @@ on property:vold.checkpoint_committed=1
 # stuff) and we absolutely want to be before netd and the system boot slot is
 # considered to have booted successfully.
 on load-bpf-programs
+    # Temporarily relax access to kallsyms so that bpfloader can resolve kernel symbols
+    # at load time.
+    #
+    # NOTE: Still requires CAP_SYSLOG and sepolicy allow rules to read /proc/kallsyms
+    write /proc/sys/kernel/kptr_restrict 1
+
     exec_start bpfloader
+
+    # Restore kallsyms protection after bpf programs have been loaded.
+    write /proc/sys/kernel/kptr_restrict 2
 
 on bpf-progs-loaded
     start netd
@@ -1182,8 +1196,6 @@ on bpf-progs-loaded
 # to start-zygote in device's init.rc to unblock zygote start.
 on zygote-start
     wait_for_prop odsign.verification.done 1
-    # A/B update verifier that marks a successful boot.
-    exec_start update_verifier
     start statsd
     start zygote
     start zygote_secondary
@@ -1352,41 +1364,7 @@ on property:perf.drop_caches=3
 on property:net.tcp_def_init_rwnd=*
     write /proc/sys/net/ipv4/tcp_default_init_rwnd ${net.tcp_def_init_rwnd}
 
-# perf_event_open syscall security:
-# Newer kernels have the ability to control the use of the syscall via SELinux
-# hooks. init tests for this, and sets sys_init.perf_lsm_hooks to 1 if the
-# kernel has the hooks. In this case, the system-wide perf_event_paranoid
-# sysctl is set to -1 (unrestricted use), and the SELinux policy is used for
-# controlling access. On older kernels, the paranoid value is the only means of
-# controlling access. It is normally 3 (allow only root), but the shell user
-# can lower it to 1 (allowing thread-scoped pofiling) via security.perf_harden.
-on load-bpf-programs && property:sys.init.perf_lsm_hooks=1
-    write /proc/sys/kernel/perf_event_paranoid -1
-on property:security.perf_harden=0 && property:sys.init.perf_lsm_hooks=""
-    write /proc/sys/kernel/perf_event_paranoid 1
-on property:security.perf_harden=1 && property:sys.init.perf_lsm_hooks=""
-    write /proc/sys/kernel/perf_event_paranoid 3
-
-# Additionally, simpleperf profiler uses debug.* and security.perf_harden
-# sysprops to be able to indirectly set these sysctls.
-on property:security.perf_harden=0
-    write /proc/sys/kernel/perf_event_max_sample_rate ${debug.perf_event_max_sample_rate:-100000}
-    write /proc/sys/kernel/perf_cpu_time_max_percent ${debug.perf_cpu_time_max_percent:-25}
-    write /proc/sys/kernel/perf_event_mlock_kb ${debug.perf_event_mlock_kb:-516}
-# Default values.
-on property:security.perf_harden=1
-    write /proc/sys/kernel/perf_event_max_sample_rate 100000
-    write /proc/sys/kernel/perf_cpu_time_max_percent 25
-    write /proc/sys/kernel/perf_event_mlock_kb 516
-
-# This property can be set only on userdebug/eng. See neverallow rule in
-# /system/sepolicy/private/property.te .
-on property:security.lower_kptr_restrict=1
-    write /proc/sys/kernel/kptr_restrict 0
-
-on property:security.lower_kptr_restrict=0
-    write /proc/sys/kernel/kptr_restrict 2
-
+import /system/etc/init/init-perfetto.rc
 
 # on shutdown
 # In device's init.rc, this trigger can be used to do device-specific actions

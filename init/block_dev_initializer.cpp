@@ -92,6 +92,12 @@ bool BlockDevInitializer::InitDmUser(const std::string& name) {
     return InitMiscDevice("dm-user!" + name);
 }
 
+bool BlockDevInitializer::InitUblkMiscDevices(const std::string& name) {
+    LOG(INFO) << "InitUblkMiscDevices " << name;
+    if (name == "ublk-control") return InitMiscDevice(name);
+
+    return InitMiscDevice("ublk-control/" + name);
+}
 bool BlockDevInitializer::InitMiscDevice(const std::string& name) {
     const std::string dm_path = "/devices/virtual/misc/" + name;
     bool found = false;

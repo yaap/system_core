@@ -711,7 +711,10 @@ void LoadSelinuxPolicyAndroid() {
 bool EarlySetupOverlays() {
     bool has_overlays = false;
     std::string contents;
-    auto result = android::base::ReadFileToString("/proc/mounts", &contents, true);
+    if (!android::base::ReadFileToString("/proc/mounts", &contents, true)) {
+        PLOG(ERROR) << "Failed to read /proc/mounts";
+        return false;
+    }
 
     auto lines = android::base::Split(contents, "\n");
     for (auto const& line : lines)

@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <log/log.h>
 
+#include <utils/AllocatorTracker.h>
 #include <utils/RefBase.h>
 #include <utils/String8.h>
 
@@ -74,7 +75,7 @@ namespace android {
 
 // Observations, invariants, etc:
 
-// By default, obects are destroyed when the last strong reference disappears
+// By default, objects are destroyed when the last strong reference disappears
 // or, if the object never had a strong reference, when the last weak reference
 // disappears.
 //
@@ -354,7 +355,8 @@ private:
         if (mTrackEnabled) {
             std::lock_guard<std::mutex> _l(mMutex);
 
-            ref_entry* ref = new ref_entry;
+            ref_entry* ref = ANDROID_NEW(ref_entry);
+
             // Reference count at the time of the snapshot, but before the
             // update.  Positive value means we increment, negative--we
             // decrement the reference count.
@@ -378,7 +380,7 @@ private:
             while (ref != NULL) {
                 if (ref->id == id) {
                     *refs = ref->next;
-                    delete ref;
+                    ANDROID_DELETE(ref_entry, ref);
                     return;
                 }
                 refs = &ref->next;
@@ -506,8 +508,8 @@ void RefBase::decStrong(const void* id) const
         refs->mBase->onLastStrongRef(id);
         int32_t flags = refs->mFlags.load(std::memory_order_relaxed);
         if ((flags&OBJECT_LIFETIME_MASK) == OBJECT_LIFETIME_STRONG) {
-            delete this;
             // The destructor does not delete refs in this case.
+            ANDROID_DELETE(RefBase, this);
         }
     }
     // Note that even with only strong reference operations, the thread
@@ -612,13 +614,13 @@ void RefBase::weakref_type::decWeak(const void* id)
                     "before it had a strong reference", impl->mBase);
         } else {
             // ALOGV("Freeing refs %p of old RefBase %p\n", this, impl->mBase);
-            delete impl;
+            ANDROID_DELETE(weakref_impl, impl);
         }
     } else {
         // This is the OBJECT_LIFETIME_WEAK case. The last weak-reference
         // is gone, we can destroy the object.
         impl->mBase->onLastWeakRef(id);
-        delete impl->mBase;
+        ANDROID_DELETE(RefBase, impl->mBase);
     }
 }
 
@@ -771,10 +773,7 @@ RefBase::weakref_type* RefBase::getWeakRefs() const
     return mRefs;
 }
 
-RefBase::RefBase()
-    : mRefs(new weakref_impl(this))
-{
-}
+RefBase::RefBase() : mRefs(ANDROID_NEW(weakref_impl, this)) {}
 
 RefBase::~RefBase()
 {
@@ -786,7 +785,7 @@ RefBase::~RefBase()
         // It's possible that the weak count is not 0 if the object
         // re-acquired a weak reference in its destructor
         if (mRefs->mWeak.load(std::memory_order_relaxed) == 0) {
-            delete mRefs;
+            ANDROID_DELETE(weakref_impl, mRefs);
         }
     } else {
         int32_t strongs = mRefs->mStrong.load(std::memory_order_relaxed);

@@ -227,6 +227,7 @@ static bool activity_manager_notify(pid_t pid, int signal, const std::string& am
 // Globals used by the abort handler.
 static pid_t g_target_thread = -1;
 static bool g_tombstoned_connected = false;
+static bool g_is_microdroid_crash = false;
 static unique_fd g_tombstoned_socket;
 static unique_fd g_output_fd;
 static unique_fd g_proto_fd;
@@ -251,7 +252,7 @@ static void Initialize(char** argv) {
     // potential listeners know that we failed.
     if (!g_tombstoned_connected) {
       if (!connect_tombstone_server(g_target_thread, &g_tombstoned_socket, &g_output_fd,
-                                    &g_proto_fd, kDebuggerdAnyIntercept)) {
+                                    &g_proto_fd, kDebuggerdAnyIntercept, g_is_microdroid_crash)) {
         // We failed to connect, not much we can do.
         LOG(ERROR) << "failed to connected to tombstoned to report failure";
         _exit(1);
@@ -708,6 +709,8 @@ int main(int argc, char** argv) {
 
         info.executable_name = get_executable_name(g_target_thread);
         info.command_line = get_command_line(g_target_thread);
+
+        g_is_microdroid_crash = is_microdroid() && info.signo != BIONIC_SIGNAL_DEBUGGER;
       } else {
         info.registers.reset(unwindstack::Regs::RemoteGet(thread));
         if (!info.registers) {
@@ -769,8 +772,9 @@ int main(int argc, char** argv) {
   {
     ATRACE_NAME("tombstoned_connect");
     LOG(INFO) << "obtaining output fd from tombstoned, type: " << dump_type;
-    g_tombstoned_connected = connect_tombstone_server(g_target_thread, &g_tombstoned_socket,
-                                                      &g_output_fd, &g_proto_fd, dump_type);
+    g_tombstoned_connected =
+        connect_tombstone_server(g_target_thread, &g_tombstoned_socket, &g_output_fd, &g_proto_fd,
+                                 dump_type, g_is_microdroid_crash);
   }
 
   if (g_tombstoned_connected) {
@@ -874,8 +878,8 @@ int main(int argc, char** argv) {
 
   // Close stdout before we notify tombstoned of completion.
   close(STDOUT_FILENO);
-  if (g_tombstoned_connected &&
-      !notify_completion(g_tombstoned_socket.get(), g_output_fd.get(), g_proto_fd.get())) {
+  if (g_tombstoned_connected && !notify_completion(g_tombstoned_socket.get(), g_output_fd.get(),
+                                                   g_proto_fd.get(), g_is_microdroid_crash)) {
     LOG(ERROR) << "failed to notify tombstoned of completion";
   }
 

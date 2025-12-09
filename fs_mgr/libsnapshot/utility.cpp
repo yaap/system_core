@@ -26,6 +26,7 @@
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
+#include <com_android_libsnapshot.h>
 #include <fs_mgr/roots.h>
 #include <liblp/property_fetcher.h>
 
@@ -296,6 +297,11 @@ bool GetODirectEnabledProperty() {
 bool GetSkipVerificationProperty() {
     auto fetcher = IPropertyFetcher::GetInstance();
     return fetcher->GetBoolProperty("ro.virtual_ab.skip_verification", false);
+}
+
+bool GetUblkEnabledProperty() {
+    auto fetcher = IPropertyFetcher::GetInstance();
+    return fetcher->GetBoolProperty("ro.virtual_ab.ublk.enabled", false);
 }
 
 std::string GetOtherPartitionName(const std::string& name) {

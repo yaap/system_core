@@ -26,6 +26,7 @@
 #include <libfiemap/image_manager.h>
 #include <liblp/mock_property_fetcher.h>
 #include <liblp/partition_opener.h>
+#include <libsnapshot/capabilities.h>
 #include <libsnapshot/snapshot.h>
 #include <storage_literals/storage_literals.h>
 #include <update_engine/update_metadata.pb.h>

@@ -65,7 +65,7 @@ static enum dev_type parse_dev_type(const char* dev_type_name) {
     }
 }
 
-static int parse_and_append_file_mapping(const char* file_mapping) {
+static int parse_and_append_file_mapping(const char* file_mapping, bool uses_symlink) {
     if (file_mapping == NULL) {
         ALOGE("Provided file mapping is null\n");
         return -1;
@@ -94,20 +94,23 @@ static int parse_and_append_file_mapping(const char* file_mapping) {
     *new_node = (struct storage_mapping_node){.file_name = file_name,
                                               .backing_storage = backing_storage,
                                               .next = storage_mapping_head,
-                                              .fd = -1};
+                                              .pending_symlink_fd = -1,
+                                              .uses_symlink = uses_symlink};
     storage_mapping_head = new_node;
     return 0;
 }
 
-static const char* _sopts = "hp:d:r:t:m:f:";
-static const struct option _lopts[] = {{"help", no_argument, NULL, 'h'},
-                                       {"trusty_dev", required_argument, NULL, 'd'},
-                                       {"data_path", required_argument, NULL, 'p'},
-                                       {"rpmb_dev", required_argument, NULL, 'r'},
-                                       {"dev_type", required_argument, NULL, 't'},
-                                       {"max_file_size_from", required_argument, NULL, 'm'},
-                                       {"file_storage_mapping", required_argument, NULL, 'f'},
-                                       {0, 0, 0, 0}};
+static const char* _sopts = "hp:d:r:t:m:f:g:";
+static const struct option _lopts[] = {
+        {"help", no_argument, NULL, 'h'},
+        {"trusty_dev", required_argument, NULL, 'd'},
+        {"data_path", required_argument, NULL, 'p'},
+        {"rpmb_dev", required_argument, NULL, 'r'},
+        {"dev_type", required_argument, NULL, 't'},
+        {"max_file_size_from", required_argument, NULL, 'm'},
+        {"file_storage_mapping", required_argument, NULL, 'f'},
+        {"file_storage_mapping_no_link", required_argument, NULL, 'g'},
+        {0, 0, 0, 0}};
 
 static void show_usage_and_exit(int code) {
     ALOGE("usage: storageproxyd -d <trusty_dev> -p <data_path> -r <rpmb_dev> -t <dev_type>  [-m "
@@ -271,7 +274,15 @@ static void parse_args(int argc, char* argv[]) {
                 break;
 
             case 'f':
-                rc = parse_and_append_file_mapping(optarg);
+                rc = parse_and_append_file_mapping(optarg, true);
+                if (rc < 0) {
+                    ALOGE("Failed to parse file mapping: %s\n", optarg);
+                    show_usage_and_exit(EXIT_FAILURE);
+                }
+                break;
+
+            case 'g':
+                rc = parse_and_append_file_mapping(optarg, false);
                 if (rc < 0) {
                     ALOGE("Failed to parse file mapping: %s\n", optarg);
                     show_usage_and_exit(EXIT_FAILURE);

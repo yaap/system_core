@@ -50,6 +50,12 @@ class Permissions {
     gid_t gid() const { return gid_; }
 
   protected:
+    enum class PathMatchType {
+        kExact,
+        kPrefix,
+        kWildcard,
+    };
+
     const std::string& name() const { return name_; }
 
   private:
@@ -57,8 +63,7 @@ class Permissions {
     mode_t perm_;
     uid_t uid_;
     gid_t gid_;
-    bool prefix_;
-    bool wildcard_;
+    PathMatchType match_type_;
     bool no_fnm_pathname_;
 };
 
@@ -146,6 +151,7 @@ class DeviceHandler : public UeventHandler {
     static std::string GetPartitionNameForDevice(const std::string& device);
     bool IsBootDeviceStrict() const;
     bool IsBootDevice(const Uevent& uevent) const;
+    void EnqueueUevent(const Uevent& uevent, ThreadPool& thread_pool) override;
 
   private:
     struct TrackedUevent {

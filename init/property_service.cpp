@@ -104,13 +104,6 @@ using android::properties::PropertyInfoEntry;
 namespace android {
 namespace init {
 
-constexpr auto FINGERPRINT_PROP = "ro.build.fingerprint";
-constexpr auto LEGACY_FINGERPRINT_PROP = "ro.build.legacy.fingerprint";
-constexpr auto ID_PROP = "ro.build.id";
-constexpr auto LEGACY_ID_PROP = "ro.build.legacy.id";
-constexpr auto VBMETA_DIGEST_PROP = "ro.boot.vbmeta.digest";
-constexpr auto DIGEST_SIZE_USED = 8;
-
 static bool persistent_properties_loaded = false;
 
 static int from_init_socket = -1;
@@ -942,35 +935,45 @@ static void property_initialize_ro_product_props() {
             }
         }
     }
+
+    // ro.build.product property is obsolete and replaced with ro.product.device, but define it for
+    // the compatibility with old features.
+    std::string device_name = GetProperty("ro.product.device", EMPTY);
+    if (GetProperty("ro.build.product", EMPTY).empty() && !device_name.empty()) {
+        std::string error;
+        auto res = PropertySetNoSocket("ro.build.product", device_name, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "Failed to set ro.build.product to " << device_name << ": err=" << res
+                       << " (" << error << ")";
+        }
+    }
 }
 
-static void property_initialize_build_id() {
-    std::string build_id = GetProperty(ID_PROP, "");
-    if (!build_id.empty()) {
+static void initialize_microdroid_properties(std::map<std::string, std::string>* properties) {
+    if (properties == NULL || !IsMicrodroid()) {
         return;
     }
 
-    std::string legacy_build_id = GetProperty(LEGACY_ID_PROP, "");
-    std::string vbmeta_digest = GetProperty(VBMETA_DIGEST_PROP, "");
-    if (vbmeta_digest.size() < DIGEST_SIZE_USED) {
-        LOG(ERROR) << "vbmeta digest size too small " << vbmeta_digest;
-        // Still try to set the id field in the unexpected case.
-        build_id = legacy_build_id;
-    } else {
-        // Derive the ro.build.id by appending the vbmeta digest to the base value.
-        build_id = legacy_build_id + "." + vbmeta_digest.substr(0, DIGEST_SIZE_USED);
+    char hostname_cstr[HOST_NAME_MAX];
+    if (gethostname(hostname_cstr, sizeof(hostname_cstr)) != 0) {
+        PLOG(ERROR) << "Failed to gethostname";
+        return;
     }
-
-    std::string error;
-    auto res = PropertySetNoSocket(ID_PROP, build_id, &error);
-    if (res != PROP_SUCCESS) {
-        LOG(ERROR) << "Failed to set " << ID_PROP << " to " << build_id;
+    const std::string hostname(hostname_cstr);
+    if (hostname != "localhost") {
+        (*properties)["ro.product.name"] = hostname;
     }
 }
 
-static std::string ConstructBuildFingerprint(bool legacy) {
+// If the ro.build.fingerprint property has not been set, derive it from constituent pieces
+static void property_derive_build_fingerprint() {
+    std::string build_fingerprint = GetProperty("ro.build.fingerprint", "");
+    if (!build_fingerprint.empty()) {
+        return;
+    }
+
     const std::string UNKNOWN = "unknown";
-    std::string build_fingerprint = GetProperty("ro.product.brand", UNKNOWN);
+    build_fingerprint = GetProperty("ro.product.brand", UNKNOWN);
     build_fingerprint += '/';
     build_fingerprint += GetProperty("ro.product.name", UNKNOWN);
 
@@ -989,10 +992,7 @@ static std::string ConstructBuildFingerprint(bool legacy) {
     build_fingerprint += ':';
     build_fingerprint += GetProperty("ro.build.version.release_or_codename", UNKNOWN);
     build_fingerprint += '/';
-
-    std::string build_id =
-            legacy ? GetProperty(LEGACY_ID_PROP, UNKNOWN) : GetProperty(ID_PROP, UNKNOWN);
-    build_fingerprint += build_id;
+    build_fingerprint += GetProperty("ro.build.id", UNKNOWN);
     build_fingerprint += '/';
     build_fingerprint += GetProperty("ro.build.version.incremental", UNKNOWN);
     build_fingerprint += ':';
@@ -1000,49 +1000,13 @@ static std::string ConstructBuildFingerprint(bool legacy) {
     build_fingerprint += '/';
     build_fingerprint += GetProperty("ro.build.tags", UNKNOWN);
 
-    return build_fingerprint;
-}
-
-// Derive the legacy build fingerprint if we overwrite the build id at runtime.
-static void property_derive_legacy_build_fingerprint() {
-    std::string legacy_build_fingerprint = GetProperty(LEGACY_FINGERPRINT_PROP, "");
-    if (!legacy_build_fingerprint.empty()) {
-        return;
-    }
-
-    // The device doesn't have a legacy build id, skipping the legacy fingerprint.
-    std::string legacy_build_id = GetProperty(LEGACY_ID_PROP, "");
-    if (legacy_build_id.empty()) {
-        return;
-    }
-
-    legacy_build_fingerprint = ConstructBuildFingerprint(true /* legacy fingerprint */);
-    LOG(INFO) << "Setting property '" << LEGACY_FINGERPRINT_PROP << "' to '"
-              << legacy_build_fingerprint << "'";
+    LOG(INFO) << "Setting property 'ro.build.fingerprint' to '" << build_fingerprint << "'";
 
     std::string error;
-    auto res = PropertySetNoSocket(LEGACY_FINGERPRINT_PROP, legacy_build_fingerprint, &error);
+    auto res = PropertySetNoSocket("ro.build.fingerprint", build_fingerprint, &error);
     if (res != PROP_SUCCESS) {
-        LOG(ERROR) << "Error setting property '" << LEGACY_FINGERPRINT_PROP << "': err=" << res
-                   << " (" << error << ")";
-    }
-}
-
-// If the ro.build.fingerprint property has not been set, derive it from constituent pieces
-static void property_derive_build_fingerprint() {
-    std::string build_fingerprint = GetProperty("ro.build.fingerprint", "");
-    if (!build_fingerprint.empty()) {
-        return;
-    }
-
-    build_fingerprint = ConstructBuildFingerprint(false /* legacy fingerprint */);
-    LOG(INFO) << "Setting property '" << FINGERPRINT_PROP << "' to '" << build_fingerprint << "'";
-
-    std::string error;
-    auto res = PropertySetNoSocket(FINGERPRINT_PROP, build_fingerprint, &error);
-    if (res != PROP_SUCCESS) {
-        LOG(ERROR) << "Error setting property '" << FINGERPRINT_PROP << "': err=" << res << " ("
-                   << error << ")";
+        LOG(ERROR) << "Error setting property 'ro.build.fingerprint': err=" << res << " (" << error
+                   << ")";
     }
 }
 
@@ -1236,6 +1200,7 @@ void PropertyLoadBootDefaults() {
         }
     }
 
+    initialize_microdroid_properties(&properties);
     for (const auto& [name, value] : properties) {
         std::string error;
         if (PropertySetNoSocket(name, value, &error) != PROP_SUCCESS) {
@@ -1248,9 +1213,7 @@ void PropertyLoadBootDefaults() {
     vendor_load_properties();
 
     property_initialize_ro_product_props();
-    property_initialize_build_id();
     property_derive_build_fingerprint();
-    property_derive_legacy_build_fingerprint();
     property_initialize_ro_cpu_abilist();
     property_initialize_ro_vendor_api_level();
 
@@ -1456,8 +1419,8 @@ void PropertyInit() {
     // If arguments are passed both on the command line and in DT,
     // properties set in DT always have priority over the command-line ones.
     ProcessKernelDt();
-    ProcessKernelCmdline();
     ProcessBootconfig();
+    ProcessKernelCmdline();
 
     // Propagate the kernel variables to internal variables
     // used by init as well as the current required properties.

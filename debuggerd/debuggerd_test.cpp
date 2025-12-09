@@ -20,7 +20,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <linux/prctl.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -1395,7 +1394,7 @@ TEST_F(CrasherTest, capabilities) {
   std::string result;
   ConsumeFd(std::move(output_fd), &result);
   ASSERT_MATCH(result, R"(name: thread_name\s+>>> .+debuggerd_test(32|64) <<<)");
-  ASSERT_BACKTRACE_FRAME(result, "tgkill");
+  ASSERT_BACKTRACE_FRAME(result, "raise");
 }
 
 TEST_F(CrasherTest, fake_pid) {
@@ -1422,7 +1421,7 @@ TEST_F(CrasherTest, fake_pid) {
 
   std::string result;
   ConsumeFd(std::move(output_fd), &result);
-  ASSERT_BACKTRACE_FRAME(result, "tgkill");
+  ASSERT_BACKTRACE_FRAME(result, "raise");
 }
 
 static const char* const kDebuggerdSeccompPolicy =

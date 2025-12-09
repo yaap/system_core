@@ -440,18 +440,20 @@ public:
      */
     static sp<Looper> getForThread();
 
-private:
-  using SequenceNumber = uint64_t;
+    static void setSkipEpollWaitForZeroTimeout();
 
-  struct Request {
-      int fd;
-      int ident;
-      int events;
-      sp<LooperCallback> callback;
-      void* data;
+  private:
+    using SequenceNumber = uint64_t;
 
-      uint32_t getEpollEvents() const;
-  };
+    struct Request {
+        int fd;
+        int ident;
+        int events;
+        sp<LooperCallback> callback;
+        void* data;
+
+        uint32_t getEpollEvents() const;
+    };
 
     struct Response {
         SequenceNumber seq;
@@ -507,6 +509,10 @@ private:
     void scheduleEpollRebuildLocked();
 
     static void initEpollEvent(struct epoll_event* eventItem);
+
+    // Whether epoll_wait should be skipped for a poll if the input timeout is
+    // zero (i.e. if the MQ already has pending messages to process).
+    inline static bool sSkipEpollWaitIfPossible = false;
 };
 
 } // namespace android

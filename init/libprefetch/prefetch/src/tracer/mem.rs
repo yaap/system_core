@@ -96,10 +96,10 @@ fn makedev(major: MajorMinorType, minor: MajorMinorType) -> DeviceNumber {
 fn build_device_number(major: &str, minor: &str) -> Result<DeviceNumber, Error> {
     Ok(makedev(
         major.parse::<MajorMinorType>().map_err(|e| Error::Custom {
-            error: format!("Failed to parse major number from {} with {}", major, e),
+            error: format!("Failed to parse major number from {major} with {e}"),
         })?,
         minor.parse::<MajorMinorType>().map_err(|e| Error::Custom {
-            error: format!("Failed to parse major number from {} with {}", major, e),
+            error: format!("Failed to parse major number from {major} with {e}"),
         })?,
     ))
 }
@@ -107,10 +107,10 @@ fn build_device_number(major: &str, minor: &str) -> Result<DeviceNumber, Error> 
 // Returns timestamp in nanoseconds
 fn build_timestamp(seconds: &str, microseconds: &str) -> Result<u64, Error> {
     let seconds = seconds.parse::<u64>().map_err(|e| Error::Custom {
-        error: format!("Failed to parse seconds from {} with {}", seconds, e),
+        error: format!("Failed to parse seconds from {seconds} with {e}"),
     })?;
     let microseconds = microseconds.parse::<u64>().map_err(|e| Error::Custom {
-        error: format!("Failed to parse microseconds from {} with {}", seconds, e),
+        error: format!("Failed to parse microseconds from {seconds} with {e}"),
     })?;
     Ok((seconds * 1_000_000_000) + (microseconds * 1_000))
 }
@@ -178,21 +178,35 @@ struct MountInfo {
 
 impl MountInfo {
     // Parses file at `path` to build `Self`.`
-    fn create(path: &str) -> Result<Self, Error> {
+    fn create(
+        path: &str,
+        exclude_mount_prefix: &[String],
+        include_mount_prefix: &[String],
+    ) -> Result<Self, Error> {
         let buf = read_to_string(path)
-            .map_err(|e| Error::Read { error: format!("Reading {} failed with: {}", path, e) })?;
-        Self::with_buf(&buf)
+            .map_err(|e| Error::Read { error: format!("Reading {path} failed with: {e}") })?;
+        Self::with_buf(&buf, exclude_mount_prefix, include_mount_prefix)
     }
 
     // Parses string in `buf` to build `Self`.
-    fn with_buf(buf: &str) -> Result<Self, Error> {
+    fn with_buf(
+        buf: &str,
+        exclude_mount_prefix: &[String],
+        include_mount_prefix: &[String],
+    ) -> Result<Self, Error> {
         let regex = Self::get_regex()?;
         let mut included_devices: HashMap<DeviceNumber, PathBuf> = HashMap::new();
         let mut excluded_devices = HashSet::new();
         let excluded_filesystem_types: HashSet<String> =
             EXCLUDED_FILESYSTEM_TYPES.iter().map(|s| String::from(*s)).collect();
         for line in buf.lines() {
-            if let Some(state) = Self::parse_line(&regex, &excluded_filesystem_types, line)? {
+            if let Some(state) = Self::parse_line(
+                &regex,
+                &excluded_filesystem_types,
+                exclude_mount_prefix,
+                include_mount_prefix,
+                line,
+            )? {
                 match state {
                     DeviceState::Include((device, path)) => {
                         included_devices.insert(device, path);
@@ -210,6 +224,8 @@ impl MountInfo {
     fn parse_line(
         re: &Regex,
         excluded_filesystem_types: &HashSet<String>,
+        exclude_mount_prefix: &[String],
+        include_mount_prefix: &[String],
         line: &str,
     ) -> Result<Option<DeviceState>, Error> {
         let caps = match re.captures(line) {
@@ -223,26 +239,30 @@ impl MountInfo {
         }
 
         let mount_point = &caps["mount_point"];
-        let mnt_pnt_with_slash = format!("{}/", mount_point);
+        let mnt_pnt_with_slash = format!("{mount_point}/");
         let device_number = build_device_number(&caps["major"], &caps["minor"])?;
         let fs_type = &caps["fs_type"];
 
         if excluded_filesystem_types.contains(fs_type) {
             info!(
-                "excluding fs type: {} for {} mount-point {} slash {}",
-                fs_type, line, mount_point, mnt_pnt_with_slash
+                "excluding fs type: {fs_type} for {line} mount-point {mount_point} slash {mnt_pnt_with_slash}"
             );
             return Ok(Some(DeviceState::Exclude(device_number)));
         }
 
-        for excluded in EXCLUDE_PATHS {
+        for excluded in exclude_mount_prefix {
             if mnt_pnt_with_slash.starts_with(excluded) {
                 info!(
-                    "exclude-paths fs type: {} for {} mount-point {} slash {}",
-                    fs_type, line, mount_point, mnt_pnt_with_slash
+                    "exclude-paths fs type: {fs_type} for {line} mount-point {mount_point} slash {mnt_pnt_with_slash}"
                 );
                 return Ok(Some(DeviceState::Exclude(device_number)));
             }
+        }
+
+        if !include_mount_prefix.is_empty()
+            && !include_mount_prefix.iter().any(|p| mnt_pnt_with_slash.starts_with(p))
+        {
+            return Ok(None);
         }
 
         Ok(Some(DeviceState::Include((device_number, PathBuf::from(mount_point)))))
@@ -262,7 +282,7 @@ impl MountInfo {
             r"\s+(?P<device_path>\S+)"
         ))
         .map_err(|e| Error::Custom {
-            error: format!("create regex for parsing mountinfo failed with: {}", e),
+            error: format!("create regex for parsing mountinfo failed with: {e}"),
         })
     }
 
@@ -307,10 +327,10 @@ impl TraceLineInfo {
         Ok(Some(TraceLineInfo {
             device: build_device_number(major, minor)?,
             inode: u64::from_str_radix(ino, 16).map_err(|e| Error::Custom {
-                error: format!("failed parsing inode: {} : {}", ino, e),
+                error: format!("failed parsing inode: {ino} : {e}"),
             })?,
             offset: offset.parse::<u64>().map_err(|e| Error::Custom {
-                error: format!("failed parsing offset: {} : {}", offset, e),
+                error: format!("failed parsing offset: {offset} : {e}"),
             })?,
             timestamp,
             order,
@@ -347,9 +367,7 @@ impl TraceLineInfo {
             r"\s+ofs=(?P<offset>[0-9]+)",
             r"(?:\s+order=(?P<order>\S+))?"
         ))
-        .map_err(|e| Error::Custom {
-            error: format!("create regex for tracing failed with: {}", e),
-        })
+        .map_err(|e| Error::Custom { error: format!("create regex for tracing failed with: {e}") })
     }
 }
 
@@ -411,7 +429,7 @@ pub(crate) struct MemTraceSubsystem {
 impl MemTraceSubsystem {
     pub fn update_configs(configs: &mut TracerConfigs) {
         for path in EXCLUDE_PATHS {
-            configs.excluded_paths.push(path.to_owned().to_string());
+            configs.exclude_mount_prefix.push(path.to_owned().to_string());
         }
 
         for event in TRACE_EVENTS {
@@ -422,11 +440,15 @@ impl MemTraceSubsystem {
 
     pub fn create_with_configs(tracer_configs: TracerConfigs) -> Result<Self, Error> {
         static INITIAL_RECORDS_CAPACITY: usize = 100_000;
-        debug!("TracerConfig: {:#?}", tracer_configs);
+        debug!("TracerConfig: {tracer_configs:#?}");
 
         let regex = TraceLineInfo::get_trace_line_regex()?;
-        let mount_info = MountInfo::create(tracer_configs.mountinfo_path.as_ref().unwrap())?;
-        debug!("mountinfo: {:#?}", mount_info);
+        let mount_info = MountInfo::create(
+            tracer_configs.mountinfo_path.as_ref().unwrap(),
+            &tracer_configs.exclude_mount_prefix,
+            &tracer_configs.include_mount_prefix,
+        )?;
+        debug!("mountinfo: {mount_info:#?}");
 
         Ok(Self {
             device_inode_map: HashMap::new(),
@@ -566,7 +588,11 @@ impl TraceSubsystem for MemTraceSubsystem {
         // the system was in early boot phase. Reload the mount_info so as to get
         // current/new mount points.
         if let Some(tracer_config) = &self.tracer_configs {
-            self.mount_info = MountInfo::create(tracer_config.mountinfo_path.as_ref().unwrap())?;
+            self.mount_info = MountInfo::create(
+                tracer_config.mountinfo_path.as_ref().unwrap(),
+                &tracer_config.exclude_mount_prefix,
+                &tracer_config.include_mount_prefix,
+            )?;
             debug!("reloaded mountinfo: {:#?}", self.mount_info);
         }
 
@@ -579,7 +605,7 @@ impl TraceSubsystem for MemTraceSubsystem {
 
             if inode_map.is_empty() {
                 return Err(Error::Custom {
-                    error: format!("Unexpected empty records for {:?}", root_path),
+                    error: format!("Unexpected empty records for {root_path:?}"),
                 });
             }
 
@@ -690,6 +716,7 @@ mod tests {
     use nix::sys::stat::{major, minor};
     use std::assert_eq;
     use std::path::Path;
+    use tempfile::NamedTempFile;
 
     use crate::tracer::tests::{copy_uncached_files_and_record_from, setup_test_dir};
 
@@ -758,7 +785,7 @@ mod tests {
         let test_base_dir = setup_test_dir();
         let (rf, mut files) =
             generate_cached_files_and_record(None, true, Some(page_size().unwrap() as u64));
-        let (_uncached_rf, uncached_files) =
+        let (_uncached_rf, uncached_files, _out_files) =
             copy_uncached_files_and_record_from(Path::new(&test_base_dir), &mut files, &rf);
         let mut mount_include = HashMap::new();
 
@@ -846,7 +873,7 @@ mod tests {
         let test_base_dir = setup_test_dir();
         let (rf, mut files) =
             generate_cached_files_and_record(None, true, Some(page_size().unwrap() as u64));
-        let (_uncached_rf, uncached_files) =
+        let (_uncached_rf, uncached_files, _out_files) =
             copy_uncached_files_and_record_from(Path::new(&test_base_dir), &mut files, &rf);
         let mut mount_include = HashMap::new();
 
@@ -921,5 +948,189 @@ mod tests {
                 new_record(1, 3 * pg_size, pg_size, 7000007000),
             ]
         );
+    }
+
+    struct FakeDevice {
+        major: MajorMinorType,
+        minor: MajorMinorType,
+        path: PathBuf,
+    }
+
+    fn create_fake_mountinfo_file(fake_devices: &Vec<FakeDevice>) -> NamedTempFile {
+        let mut mountinfo_path = NamedTempFile::new().unwrap();
+        for device in fake_devices {
+            mountinfo_path
+                .write_all(
+                    format!(
+                        "26 24 {}:{} / {} ro,nodev,noatime shared:1 - ext4 /dev/block/dm-3 ro,\
+                        seclabel,errors=panic\n",
+                        device.major,
+                        device.minor,
+                        device.path.to_str().unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        }
+        mountinfo_path
+    }
+
+    fn create_fake_mountinfo(
+        exclude_mount_prefix: &[String],
+        include_mount_prefix: &[String],
+        fake_devices: Vec<FakeDevice>,
+    ) -> MountInfo {
+        let mountinfo = create_fake_mountinfo_file(&fake_devices);
+        let mountinfo_path = mountinfo.path().to_str().unwrap();
+
+        MountInfo::create(mountinfo_path, exclude_mount_prefix, include_mount_prefix).unwrap()
+    }
+
+    #[test]
+    fn test_mount_info() {
+        let mount_info = create_fake_mountinfo(
+            &vec![],
+            &vec![],
+            vec![
+                FakeDevice {
+                    major: 0 as MajorMinorType,
+                    minor: 1 as MajorMinorType,
+                    path: PathBuf::from("/normal"),
+                },
+                FakeDevice {
+                    major: 2 as MajorMinorType,
+                    minor: 3 as MajorMinorType,
+                    path: PathBuf::from("/excluded"),
+                },
+                FakeDevice {
+                    major: 4 as MajorMinorType,
+                    minor: 5 as MajorMinorType,
+                    path: PathBuf::from("/included"),
+                },
+            ],
+        );
+
+        let normal_device_number = makedev(0, 1);
+        let excluded_device_number = makedev(2, 3);
+        let included_device_number = makedev(4, 5);
+
+        // If no include/exclude mount points are specified, all devices should be included
+        assert!(mount_info.included_devices.contains_key(&normal_device_number));
+        assert!(mount_info.included_devices.contains_key(&included_device_number));
+        assert!(mount_info.included_devices.contains_key(&excluded_device_number));
+    }
+
+    #[test]
+    fn test_mountinfo_exclude_mount_prefix() {
+        let mount_info = create_fake_mountinfo(
+            &vec![String::from("/excluded")],
+            &vec![],
+            vec![
+                FakeDevice {
+                    major: 0 as MajorMinorType,
+                    minor: 1 as MajorMinorType,
+                    path: PathBuf::from("/normal"),
+                },
+                FakeDevice {
+                    major: 2 as MajorMinorType,
+                    minor: 3 as MajorMinorType,
+                    path: PathBuf::from("/excluded"),
+                },
+                FakeDevice {
+                    major: 4 as MajorMinorType,
+                    minor: 5 as MajorMinorType,
+                    path: PathBuf::from("/included"),
+                },
+            ],
+        );
+
+        let normal_device_number = makedev(0, 1);
+        let excluded_device_number = makedev(2, 3);
+        let included_device_number = makedev(4, 5);
+
+        // Devices in excluded mount point are excluded.
+        assert!(mount_info.included_devices.contains_key(&normal_device_number));
+        assert!(mount_info.included_devices.contains_key(&included_device_number));
+
+        assert!(!mount_info.included_devices.contains_key(&excluded_device_number));
+        assert!(mount_info.excluded_devices.contains(&excluded_device_number));
+    }
+
+    #[test]
+    fn test_mountinfo_include_mount_prefix() {
+        let mount_info = create_fake_mountinfo(
+            &vec![],
+            &vec![String::from("/included")],
+            vec![
+                FakeDevice {
+                    major: 0 as MajorMinorType,
+                    minor: 1 as MajorMinorType,
+                    path: PathBuf::from("/normal"),
+                },
+                FakeDevice {
+                    major: 2 as MajorMinorType,
+                    minor: 3 as MajorMinorType,
+                    path: PathBuf::from("/excluded"),
+                },
+                FakeDevice {
+                    major: 4 as MajorMinorType,
+                    minor: 5 as MajorMinorType,
+                    path: PathBuf::from("/included"),
+                },
+            ],
+        );
+
+        let normal_device_number = makedev(0, 1);
+        let excluded_device_number = makedev(2, 3);
+        let included_device_number = makedev(4, 5);
+
+        // Only devices on an included mount point are included.
+        assert!(mount_info.included_devices.contains_key(&included_device_number));
+
+        assert!(!mount_info.included_devices.contains_key(&normal_device_number));
+        assert!(!mount_info.included_devices.contains_key(&excluded_device_number));
+    }
+
+    #[test]
+    fn test_mountinfo_mixed_mount_prefix() {
+        let mount_info = create_fake_mountinfo(
+            &vec![String::from("/included/excluded")],
+            &vec![String::from("/included")],
+            vec![
+                FakeDevice {
+                    major: 0 as MajorMinorType,
+                    minor: 1 as MajorMinorType,
+                    path: PathBuf::from("/not_start_with/included"),
+                },
+                FakeDevice {
+                    major: 2 as MajorMinorType,
+                    minor: 3 as MajorMinorType,
+                    path: PathBuf::from("/included/not_start_with/excluded"),
+                },
+                FakeDevice {
+                    major: 4 as MajorMinorType,
+                    minor: 5 as MajorMinorType,
+                    path: PathBuf::from("/included/excluded"),
+                },
+                FakeDevice {
+                    major: 6 as MajorMinorType,
+                    minor: 7 as MajorMinorType,
+                    path: PathBuf::from("/included/not_excluded"),
+                },
+            ],
+        );
+
+        let not_start_with_included_device_number = makedev(0, 1);
+        let not_start_with_excluded_prefix_device_number = makedev(2, 3);
+        let excluded_device_number = makedev(4, 5);
+        let included_device_number = makedev(6, 7);
+
+        assert!(mount_info
+            .included_devices
+            .contains_key(&not_start_with_excluded_prefix_device_number));
+        assert!(mount_info.included_devices.contains_key(&included_device_number));
+
+        assert!(!mount_info.included_devices.contains_key(&not_start_with_included_device_number));
+        assert!(!mount_info.included_devices.contains_key(&excluded_device_number));
     }
 }

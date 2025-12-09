@@ -56,7 +56,6 @@ using namespace android::storage_literals;
 constexpr char kPreferCacheBackingStorageProp[] = "fs_mgr.overlayfs.prefer_cache_backing_storage";
 
 constexpr char kCacheMountPoint[] = "/cache";
-constexpr char kPhysicalDevice[] = "/dev/block/by-name/";
 
 // Mount tree to temporarily hold references to submounts.
 constexpr char kMoveMountTempDir[] = "/dev/remount";

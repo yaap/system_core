@@ -62,6 +62,7 @@ using ::testing::TestWithParam;
 struct TestParam {
     bool io_uring;
     bool o_direct;
+    bool ublk;
     std::string compression;
     int block_size;
     int num_threads;

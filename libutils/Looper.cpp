@@ -99,6 +99,10 @@ sp<Looper> Looper::getForThread() {
     return gThreadLocalLooper;
 }
 
+void Looper::setSkipEpollWaitForZeroTimeout() {
+    Looper::sSkipEpollWaitIfPossible = true;
+}
+
 sp<Looper> Looper::prepare(int opts) {
     bool allowNonCallbacks = opts & PREPARE_ALLOW_NON_CALLBACKS;
     sp<Looper> looper = Looper::getForThread();
@@ -197,6 +201,8 @@ int Looper::pollInner(int timeoutMillis) {
     ALOGD("%p ~ pollOnce - waiting: timeoutMillis=%d", this, timeoutMillis);
 #endif
 
+    int originalTimeout = timeoutMillis;
+
     // Adjust the timeout based on when the next message is due.
     if (timeoutMillis != 0 && mNextMessageUptime != LLONG_MAX) {
         nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
@@ -216,14 +222,20 @@ int Looper::pollInner(int timeoutMillis) {
     mResponses.clear();
     mResponseIndex = 0;
 
-    // We are about to idle.
-    std::atomic_store_explicit(&mPolling, true, std::memory_order_relaxed);
-
+    int eventCount = 0;
     struct epoll_event eventItems[EPOLL_MAX_EVENTS];
-    int eventCount = epoll_wait(mEpollFd.get(), eventItems, EPOLL_MAX_EVENTS, timeoutMillis);
 
-    // No longer idling.
-    std::atomic_store_explicit(&mPolling, false, std::memory_order_relaxed);
+    // A timeout of 0 indicates that there are already messages to handle, and
+    // we don't need to poll for more yet.
+    if (!sSkipEpollWaitIfPossible || originalTimeout != 0 || mRequests.size() > 0) {
+        // We are about to idle.
+        std::atomic_store_explicit(&mPolling, true, std::memory_order_relaxed);
+
+        eventCount = epoll_wait(mEpollFd.get(), eventItems, EPOLL_MAX_EVENTS, timeoutMillis);
+
+        // No longer idling.
+        std::atomic_store_explicit(&mPolling, false, std::memory_order_relaxed);
+    }
 
     // Acquire lock.
     mLock.lock();

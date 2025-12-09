@@ -221,8 +221,23 @@ static void check_fs(const std::string& blk_device, const std::string& fs_type,
     int ret;
     long tmpmnt_flags = MS_NOATIME | MS_NOEXEC | MS_NOSUID;
     auto tmpmnt_opts = "errors=remount-ro"s;
-    const char* e2fsck_argv[] = {E2FSCK_BIN, "-y", blk_device.c_str()};
+    // Auto repair (aka preen) mode. Fast. Doesn't require `-y`, but can leave some errors
+    // uncorrected, in which case we do full-repair below.
+    const char* e2fsck_argv[] = {E2FSCK_BIN, "-p", blk_device.c_str()};
+    // Full repair.
     const char* e2fsck_forced_argv[] = {E2FSCK_BIN, "-f", "-y", blk_device.c_str()};
+    enum class E2fsckExitCode : int {
+        // e2fsck exit codes taken from the man page
+        NO_ERROR = 0,
+        ERROR_CORRECTED = 1,
+        ERROR_CORRECTED_REBOOT_REQUIRED = 2,
+        ERROR_UNCORRECTED = 4,
+        // Exit codes below can never happen in our case, but listed anyway for completeness
+        OPERATIONAL_ERROR = 8,
+        SYNTAX_ERROR = 16,
+        CANCELED_BY_USER = 32,
+        SHARED_LIB_ERROR = 64,
+    };
 
     if (*fs_stat & FS_STAT_INVALID_MAGIC) {  // will fail, so do not try
         return;
@@ -268,7 +283,8 @@ static void check_fs(const std::string& blk_device, const std::string& fs_type,
                   << " (executable not in system image)";
         } else {
             LINFO << "Running " << E2FSCK_BIN << " on " << realpath(blk_device);
-            if (should_force_check(*fs_stat)) {
+            bool forced = should_force_check(*fs_stat);
+            if (forced) {
                 ret = logwrap_fork_execvp(ARRAY_SIZE(e2fsck_forced_argv), e2fsck_forced_argv,
                                           &status, false, LOG_KLOG | LOG_FILE, false,
                                           FSCK_LOG_FILE);
@@ -283,7 +299,21 @@ static void check_fs(const std::string& blk_device, const std::string& fs_type,
                 *fs_stat |= FS_STAT_FSCK_FAILED;
             } else if (status != 0) {
                 LINFO << "e2fsck returned status 0x" << std::hex << status;
-                *fs_stat |= FS_STAT_FSCK_FS_FIXED;
+                bool corrected = (status & static_cast<int>(E2fsckExitCode::ERROR_CORRECTED)) != 0;
+                bool uncorrected =
+                        (status & static_cast<int>(E2fsckExitCode::ERROR_UNCORRECTED)) != 0;
+                if (corrected && !uncorrected) {
+                    // TODO: nobody seems to be checking this bit??
+                    *fs_stat |= FS_STAT_FSCK_FS_FIXED;
+                } else if (uncorrected && !forced) {
+                    // If uncorrected error remains, re-run with full check. Turning the
+                    // FS_STAT_FSCK_FAILED bit on will make should_force_check to return true
+                    LERROR << "Uncorrected error remains. Trying harder.";
+                    *fs_stat |= FS_STAT_FSCK_FAILED;
+                    check_fs(blk_device, fs_type, target, fs_stat);
+                } else {
+                    *fs_stat |= FS_STAT_FSCK_FAILED;
+                }
             }
         }
     } else if (is_f2fs(fs_type)) {
@@ -321,8 +351,10 @@ static void check_fs(const std::string& blk_device, const std::string& fs_type,
             }
         }
     }
+
     android::base::SetProperty("ro.boottime.init.fsck." + Basename(target),
                                std::to_string(t.duration().count()));
+    LINFO << "fsck on " << target << " took " << t.duration();
     return;
 }
 

@@ -28,16 +28,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <set>
 #include <thread>
 
 #include <android-base/chrono_utils.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <fstab/fstab.h>
-#include <selinux/android.h>
-#include <selinux/selinux.h>
 
+#include "coldboot.h"
 #include "devices.h"
 #include "firmware_handler.h"
 #include "modalias_handler.h"
@@ -74,12 +72,17 @@
 //    should be handled first by another event. e.g. An add event must be handled first before
 //    removal. A device foo must be added before foo/bar.
 // 2) The cold boot is unlikely to have events that depend on another in a critical manner.
-// Therefore, ueventd handles uevent message in parallel by fork() subprocesses. We chose fork()
-// instead of threads, since selabel_lookup_best_match function was not thread-safe. It's
-// been fixed today, and we are testing the thread-safety of selabel_lookup_best_match and other
-// necessary functions (setfscreatecon and setegid syscall wrapper of bionic) in ueventd_test.
-// However, we have not moved to thread-based parallelization. We didn't observe any significant
-// performance gain with threads compared to multi-processes, and multi-process is simpler.
+// Therefore, ueventd handles uevent message in parallel. We provide two options for the
+// parallel handling:
+// 1) ueventd forks 'n' separate uevent handler subprocesses and has each of them to handle the
+//    uevents in the queue based on a starting offset (their process number) and a stride (the total
+//    number of processes).
+// 2) Coldboot threadpool: ueventd uses a threadpool to handle uevents.
+// The first option is the default option. The second option can be enabled by a feature flag
+// RELEASE_UEVENTD_COLDBOOT_THREADPOOL. The second option provides the better performance since it
+// distributes the uevent handling workload evenly across all the threads, while the first option
+// only assigns equal numbers of uevents to each process and does not take the actual workload of
+// each of them into consideration.
 
 // One other important caveat during the boot process is the handling of SELinux restorecon.
 // Since many devices have child devices, calling selinux_android_restorecon() recursively for each
@@ -90,15 +93,19 @@
 
 // With all of the above considered, the cold boot process has the below steps:
 // 1) ueventd regenerates uevents by doing the /sys traversal and listens to the netlink socket for
-//    the generated uevents.  It writes these uevents into a queue represented by a vector.
+//    the generated uevents.  It writes these uevents into a queue.
 //
-// 2) ueventd forks 'n' separate uevent handler subprocesses and has each of them to handle the
-//    uevents in the queue based on a starting offset (their process number) and a stride (the total
-//    number of processes).  Note that no IPC happens at this point and only const functions from
-//    DeviceHandler should be called from this context.
+// 2 (When threadpool is disabled)) ueventd forks 'n' separate uevent handler subprocesses and has
+//    each of them to handle the uevents in the queue based on a starting offset (their process
+//    number) and a stride (the total number of processes).  Note that no IPC happens at this point
+//    and only const functions from DeviceHandler should be called from this context.
+
+// 2 (When threadpool is enabled)) ueventd uses a threadpool to handle uevents. The threadpool
+//    has 'n' threads and each thread is responsible for handling available uevents in the queue.
 //
-// 3) In parallel to the subprocesses handling the uevents, the main thread of ueventd calls
-//    selinux_android_restorecon() recursively on /sys/class, /sys/block, and /sys/devices.
+// 3) If enable_parallel_restorecon is false, the main thread of ueventd calls
+//    selinux_android_restorecon() recursively on /sys in parallel to the subprocesses or threadpool
+//    handling the uevents.
 //
 // 4) Once the restorecon operation finishes, the main thread calls waitpid() to wait for all
 //    subprocess handlers to complete and exit.  Once this happens, it marks coldboot as having
@@ -114,191 +121,6 @@
 
 namespace android {
 namespace init {
-
-class ColdBoot {
-  public:
-    ColdBoot(UeventListener& uevent_listener,
-             std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers,
-             bool enable_parallel_restorecon,
-             std::vector<std::string> parallel_restorecon_queue)
-        : uevent_listener_(uevent_listener),
-          uevent_handlers_(uevent_handlers),
-          num_handler_subprocesses_(std::thread::hardware_concurrency() ?: 4),
-          enable_parallel_restorecon_(enable_parallel_restorecon),
-          parallel_restorecon_queue_(parallel_restorecon_queue) {}
-
-    void Run();
-
-  private:
-    void UeventHandlerMain(unsigned int process_num, unsigned int total_processes);
-    void RegenerateUevents();
-    void ForkSubProcesses();
-    void WaitForSubProcesses();
-    void RestoreConHandler(unsigned int process_num, unsigned int total_processes);
-    void GenerateRestoreCon(const std::string& directory);
-
-    UeventListener& uevent_listener_;
-    std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers_;
-
-    unsigned int num_handler_subprocesses_;
-    bool enable_parallel_restorecon_;
-
-    std::vector<Uevent> uevent_queue_;
-
-    std::set<pid_t> subprocess_pids_;
-
-    std::vector<std::string> restorecon_queue_;
-
-    std::vector<std::string> parallel_restorecon_queue_;
-};
-
-void ColdBoot::UeventHandlerMain(unsigned int process_num, unsigned int total_processes) {
-    for (unsigned int i = process_num; i < uevent_queue_.size(); i += total_processes) {
-        auto& uevent = uevent_queue_[i];
-
-        for (auto& uevent_handler : uevent_handlers_) {
-            uevent_handler->HandleUevent(uevent);
-        }
-    }
-}
-
-void ColdBoot::RestoreConHandler(unsigned int process_num, unsigned int total_processes) {
-    android::base::Timer t_process;
-
-    for (unsigned int i = process_num; i < restorecon_queue_.size(); i += total_processes) {
-        android::base::Timer t;
-        auto& dir = restorecon_queue_[i];
-
-        selinux_android_restorecon(dir.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE);
-
-        //Mark a dir restorecon operation for 50ms,
-        //Maybe you can add this dir to the ueventd.rc script to parallel processing
-        if (t.duration() > 50ms) {
-            LOG(INFO) << "took " << t.duration().count() <<"ms restorecon '"
-                        << dir.c_str() << "' on process '" << process_num  <<"'";
-        }
-    }
-
-    //Calculate process restorecon time
-    LOG(VERBOSE) << "took " << t_process.duration().count() << "ms on process '"
-                << process_num  << "'";
-}
-
-void ColdBoot::GenerateRestoreCon(const std::string& directory) {
-    std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(directory.c_str()), &closedir);
-
-    if (!dir) {
-        PLOG(WARNING) << "opendir " << directory.c_str();
-        return;
-    }
-
-    struct dirent* dent;
-    while ((dent = readdir(dir.get())) != NULL) {
-        if (strcmp(dent->d_name, ".") == 0 || strcmp(dent->d_name, "..") == 0) continue;
-
-        struct stat st;
-        if (fstatat(dirfd(dir.get()), dent->d_name, &st, 0) == -1) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            std::string fullpath = directory + "/" + dent->d_name;
-            auto parallel_restorecon =
-                std::find(parallel_restorecon_queue_.begin(),
-                    parallel_restorecon_queue_.end(), fullpath);
-            if (parallel_restorecon == parallel_restorecon_queue_.end()) {
-                restorecon_queue_.emplace_back(fullpath);
-            }
-        }
-    }
-}
-
-void ColdBoot::RegenerateUevents() {
-    uevent_listener_.RegenerateUevents([this](const Uevent& uevent) {
-        uevent_queue_.emplace_back(uevent);
-        return ListenerAction::kContinue;
-    });
-}
-
-void ColdBoot::ForkSubProcesses() {
-    for (unsigned int i = 0; i < num_handler_subprocesses_; ++i) {
-        auto pid = fork();
-        if (pid < 0) {
-            PLOG(FATAL) << "fork() failed!";
-        }
-
-        if (pid == 0) {
-            UeventHandlerMain(i, num_handler_subprocesses_);
-            if (enable_parallel_restorecon_) {
-                RestoreConHandler(i, num_handler_subprocesses_);
-            }
-            _exit(EXIT_SUCCESS);
-        }
-
-        subprocess_pids_.emplace(pid);
-    }
-}
-
-void ColdBoot::WaitForSubProcesses() {
-    // Treat subprocesses that crash or get stuck the same as if ueventd itself has crashed or gets
-    // stuck.
-    //
-    // When a subprocess crashes, we fatally abort from ueventd.  init will restart ueventd when
-    // init reaps it, and the cold boot process will start again.  If this continues to fail, then
-    // since ueventd is marked as a critical service, init will reboot to bootloader.
-    //
-    // When a subprocess gets stuck, keep ueventd spinning waiting for it.  init has a timeout for
-    // cold boot and will reboot to the bootloader if ueventd does not complete in time.
-    while (!subprocess_pids_.empty()) {
-        int status;
-        pid_t pid = TEMP_FAILURE_RETRY(waitpid(-1, &status, 0));
-        if (pid == -1) {
-            PLOG(ERROR) << "waitpid() failed";
-            continue;
-        }
-
-        auto it = std::find(subprocess_pids_.begin(), subprocess_pids_.end(), pid);
-        if (it == subprocess_pids_.end()) continue;
-
-        if (WIFEXITED(status)) {
-            if (WEXITSTATUS(status) == EXIT_SUCCESS) {
-                subprocess_pids_.erase(it);
-            } else {
-                LOG(FATAL) << "subprocess exited with status " << WEXITSTATUS(status);
-            }
-        } else if (WIFSIGNALED(status)) {
-            LOG(FATAL) << "subprocess killed by signal " << WTERMSIG(status);
-        }
-    }
-}
-
-void ColdBoot::Run() {
-    android::base::Timer cold_boot_timer;
-
-    RegenerateUevents();
-
-    if (enable_parallel_restorecon_) {
-        if (parallel_restorecon_queue_.empty()) {
-            parallel_restorecon_queue_.emplace_back("/sys");
-            // takes long time for /sys/devices, parallelize it
-            parallel_restorecon_queue_.emplace_back("/sys/devices");
-            LOG(INFO) << "Parallel processing directory is not set, set the default";
-        }
-        for (const auto& dir : parallel_restorecon_queue_) {
-            selinux_android_restorecon(dir.c_str(), 0);
-            GenerateRestoreCon(dir);
-        }
-    }
-
-    ForkSubProcesses();
-
-    if (!enable_parallel_restorecon_) {
-        selinux_android_restorecon("/sys", SELINUX_ANDROID_RESTORECON_RECURSE);
-    }
-
-    WaitForSubProcesses();
-
-    android::base::SetProperty(kColdBootDoneProp, "true");
-    LOG(INFO) << "Coldboot took " << cold_boot_timer.duration().count() / 1000.0f << " seconds";
-}
 
 static UeventdConfiguration GetConfiguration() {
     if (IsMicrodroid()) {
@@ -339,7 +161,7 @@ static UeventdConfiguration GetConfiguration() {
 }
 
 void main_loop(const UeventListener& uevent_listener,
-               const std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers) {
+               const std::vector<std::shared_ptr<UeventHandler>>& uevent_handlers) {
     uevent_listener.Poll([&uevent_handlers](const Uevent& uevent) {
         for (auto& uevent_handler : uevent_handlers) {
             uevent_handler->HandleUevent(uevent);
@@ -349,7 +171,7 @@ void main_loop(const UeventListener& uevent_listener,
 }
 
 void parallel_main_loop(const UeventListener& uevent_listener,
-                        const std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers,
+                        const std::vector<std::shared_ptr<UeventHandler>>& uevent_handlers,
                         size_t num_threads) {
     LOG(INFO) << "parallel main loop is enabled with " << num_threads << " threads";
 
@@ -389,7 +211,7 @@ int ueventd_main(int argc, char** argv) {
     SelinuxSetupKernelLogging();
     SelabelInitialize();
 
-    std::vector<std::unique_ptr<UeventHandler>> uevent_handlers;
+    std::vector<std::shared_ptr<UeventHandler>> uevent_handlers;
 
     auto ueventd_configuration = GetConfiguration();
 
@@ -401,7 +223,7 @@ int ueventd_main(int argc, char** argv) {
     // we get here we know that the boot partition has already shown up (if
     // we're looking for it) so just regenerating events is enough to know
     // we'll see it.
-    std::unique_ptr<DeviceHandler> device_handler = std::make_unique<DeviceHandler>(
+    std::shared_ptr<DeviceHandler> device_handler = std::make_shared<DeviceHandler>(
             std::move(ueventd_configuration.dev_permissions),
             std::move(ueventd_configuration.sysfs_permissions),
             std::move(ueventd_configuration.drivers), std::move(ueventd_configuration.subsystems),
@@ -411,16 +233,16 @@ int ueventd_main(int argc, char** argv) {
         return uuid_check_done ? ListenerAction::kStop : ListenerAction::kContinue;
     });
 
+    if (ueventd_configuration.enable_modalias_handling) {
+        std::vector<std::string> base_paths = {"/odm/lib/modules", "/vendor/lib/modules"};
+        uevent_handlers.emplace_back(std::make_shared<ModaliasHandler>(base_paths));
+    }
     uevent_handlers.emplace_back(std::move(device_handler));
-    uevent_handlers.emplace_back(std::make_unique<FirmwareHandler>(
+    uevent_handlers.emplace_back(std::make_shared<FirmwareHandler>(
             std::move(ueventd_configuration.firmware_directories),
             std::move(ueventd_configuration.external_firmware_handlers),
             /*serial_handler_after_cold_boot=*/false));
 
-    if (ueventd_configuration.enable_modalias_handling) {
-        std::vector<std::string> base_paths = {"/odm/lib/modules", "/vendor/lib/modules"};
-        uevent_handlers.emplace_back(std::make_unique<ModaliasHandler>(base_paths));
-    }
     if (!android::base::GetBoolProperty(kColdBootDoneProp, false)) {
         ColdBoot cold_boot(uevent_listener, uevent_handlers,
                            ueventd_configuration.enable_parallel_restorecon,
