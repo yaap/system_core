@@ -1044,9 +1044,11 @@ bool SnapshotManager::MapSourceDevice(LockedFile* lock, const std::string& name,
     }
 
     auto old_name = GetOtherPartitionName(name);
+    auto slot_suffix = device_->GetSlotSuffix();
+    auto slot = SlotNumberForSlotSuffix(slot_suffix);
 
     CreateLogicalPartitionParams params = {
-            .block_device = device_->GetSuperDevice(),
+            .block_device = device_->GetSuperDevice(slot),
             .metadata = metadata,
             .partition_name = old_name,
             .timeout_ms = timeout_ms,
@@ -2038,7 +2040,7 @@ bool SnapshotManager::CollapseSnapshotDevice(LockedFile* lock, const std::string
     uint32_t slot = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
     // Create a DmTable that is identical to the base device.
     CreateLogicalPartitionParams base_device_params{
-            .block_device = device_->GetSuperDevice(),
+            .block_device = device_->GetSuperDevice(slot),
             .metadata_slot = slot,
             .partition_name = name,
             .partition_opener = &device_->GetPartitionOpener(),
@@ -2325,7 +2327,7 @@ bool SnapshotManager::PerformInitTransition(InitTransition transition,
 std::unique_ptr<LpMetadata> SnapshotManager::ReadCurrentMetadata() {
     const auto& opener = device_->GetPartitionOpener();
     uint32_t slot = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
-    auto super_device = device_->GetSuperDevice();
+    auto super_device = device_->GetSuperDevice(slot);
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, slot);
     if (!metadata) {
         LOG(ERROR) << "Could not read dynamic partition metadata for device: " << super_device;
@@ -2394,7 +2396,7 @@ bool SnapshotManager::GetSnapshotFlashingStatus(LockedFile* lock,
     // metadata are in sync, so flashing all partitions on the source slot will
     // remove the UPDATED flag on the target slot as well.
     const auto& opener = device_->GetPartitionOpener();
-    auto super_device = device_->GetSuperDevice();
+    auto super_device = device_->GetSuperDevice(target_slot);
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, target_slot);
     if (!metadata) {
         return false;
@@ -3432,7 +3434,7 @@ bool SnapshotManager::MapAllSnapshots(const std::chrono::milliseconds& timeout_m
     const auto& opener = device_->GetPartitionOpener();
     auto slot_suffix = device_->GetOtherSlotSuffix();
     auto slot_number = SlotNumberForSlotSuffix(slot_suffix);
-    auto super_device = device_->GetSuperDevice();
+    auto super_device = device_->GetSuperDevice(slot_number);
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, slot_number);
     if (!metadata) {
         LOG(ERROR) << "MapAllSnapshots could not read dynamic partition metadata for device: "
@@ -3868,7 +3870,7 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
     uint32_t current_slot = SlotNumberForSlotSuffix(current_suffix);
     auto target_suffix = device_->GetOtherSlotSuffix();
     uint32_t target_slot = SlotNumberForSlotSuffix(target_suffix);
-    auto current_super = device_->GetSuperDevice();
+    auto current_super = device_->GetSuperDevice(current_slot);
 
     auto current_metadata = MetadataBuilder::New(opener, current_super, current_slot);
     if (current_metadata == nullptr) {
@@ -4007,8 +4009,8 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
                                     all_snapshot_status);
     if (!ret.is_ok()) return ret;
 
-    if (!UpdatePartitionTable(opener, device_->GetSuperDevice(), *exported_target_metadata,
-                              target_slot)) {
+    if (!UpdatePartitionTable(opener, device_->GetSuperDevice(target_slot),
+                              *exported_target_metadata, target_slot)) {
         LOG(ERROR) << "Cannot write target metadata";
         return Return::Error();
     }
@@ -4466,7 +4468,7 @@ bool SnapshotManager::UnmapAllPartitionsInRecovery() {
 
     const auto& opener = device_->GetPartitionOpener();
     uint32_t slot = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
-    auto super_device = device_->GetSuperDevice();
+    auto super_device = device_->GetSuperDevice(slot);
     auto metadata = android::fs_mgr::ReadMetadata(opener, super_device, slot);
     if (!metadata) {
         LOG(ERROR) << "Could not read dynamic partition metadata for device: " << super_device;
@@ -4627,13 +4629,14 @@ bool SnapshotManager::HandleImminentDataWipe(const std::function<void()>& callba
                 break;
             }
             if (!HasForwardMergeIndicator()) {
+                auto slot_number = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
                 auto other_slot_number = SlotNumberForSlotSuffix(device_->GetOtherSlotSuffix());
 
                 // We're not allowed to forward merge, so forcefully rollback the
                 // slot switch.
                 LOG(INFO) << "Allowing wipe due to lack of forward merge indicator; reverting to "
                              "old slot since update will be deleted.";
-                device_->SetSlotAsUnbootable(SlotNumberForSlotSuffix(device_->GetSlotSuffix()));
+                device_->SetSlotAsUnbootable(slot_number);
                 device_->SetActiveBootSlot(other_slot_number);
                 break;
             }
@@ -4655,7 +4658,8 @@ bool SnapshotManager::HandleImminentDataWipe(const std::function<void()>& callba
     }
 
     if (try_merge) {
-        auto super_path = device_->GetSuperDevice();
+        auto slot_number = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
+        auto super_path = device_->GetSuperDevice(slot_number);
         if (!CreateLogicalAndSnapshotPartitions(super_path, 20s)) {
             LOG(ERROR) << "Unable to map partitions to complete merge.";
             return false;
@@ -4702,7 +4706,8 @@ bool SnapshotManager::FinishMergeInRecovery() {
         return false;
     }
 
-    auto super_path = device_->GetSuperDevice();
+    auto slot_number = SlotNumberForSlotSuffix(device_->GetSlotSuffix());
+    auto super_path = device_->GetSuperDevice(slot_number);
     if (!CreateLogicalAndSnapshotPartitions(super_path, 20s)) {
         LOG(ERROR) << "Unable to map partitions to complete merge.";
         return false;
@@ -4831,7 +4836,9 @@ CreateResult SnapshotManager::RecoveryCreateSnapshotDevices(
         return CreateResult::NOT_CREATED;
     }
 
-    auto super_path = device_->GetSuperDevice();
+    auto slot_suffix = device_->GetOtherSlotSuffix();
+    auto slot_number = SlotNumberForSlotSuffix(slot_suffix);
+    auto super_path = device_->GetSuperDevice(slot_number);
     if (!CreateLogicalAndSnapshotPartitions(super_path, 20s)) {
         LOG(ERROR) << "Unable to map partitions.";
         return CreateResult::ERROR;
