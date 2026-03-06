@@ -57,7 +57,7 @@ bool NetlinkListener::onDataAvailable(SocketClient *cli)
     count = TEMP_FAILURE_RETRY(uevent_kernel_recv(socket,
             mBuffer, sizeof(mBuffer), require_group, &uid));
     if (count < 0) {
-        SLOGE("recvmsg failed (%s)", strerror(errno));
+//        SLOGE("recvmsg failed (%s)", strerror(errno));
         return false;
     }
 
