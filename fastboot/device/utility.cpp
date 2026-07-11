@@ -195,6 +195,9 @@ std::vector<std::string> ListPartitions(FastbootDevice* device) {
 }
 
 bool GetDeviceLockStatus() {
+    std::string fenrir;
+    if (android::fs_mgr::GetKernelCmdline("fenrir", &fenrir) && fenrir == "true")
+        return false;
     return android::base::GetProperty("ro.boot.verifiedbootstate", "") != "orange";
 }
 
